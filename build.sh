@@ -19,7 +19,7 @@ S3="https://s3.amazonaws.com/spec.ccfc.min"
 GITHUB="https://github.com/firecracker-microvm/firecracker"
 ALPINE_CDN="https://dl-cdn.alpinelinux.org/alpine"
 
-for c in curl tar truncate mke2fs ssh-keygen openssl unshare; do
+for c in curl tar truncate mke2fs ssh-keygen openssl unshare python3; do
   command -v "$c" >/dev/null || { echo "error: missing required tool: $c" >&2; exit 1; }
 done
 
@@ -64,11 +64,25 @@ if [ ! -e images/vmlinux ]; then
   key=$(curl -fsSL --retry 3 "$S3?list-type=2&prefix=$prefix$ARCH/vmlinux-" \
     | grep -o '<Key>[^<]*' | sed 's/<Key>//' | grep -vE '\.config$|-no-acpi$' | sort -V | tail -1)
   ver=${key##*/vmlinux-}
-  # the CI bucket publishes no checksum for kernels; record the digest for
-  # subsequent verification instead (see the review note in PLAN.md)
+  # the CI bucket publishes no checksum for kernels: record a
+  # trust-on-first-use digest and verify reuse against it (a tampered or
+  # truncated kernel must not boot silently)
   curl -fL --retry 3 "$S3/$key" -o "images/vmlinux-$ver"
   sha256sum "images/vmlinux-$ver" | awk '{print $1}' > "images/vmlinux-$ver.sha256"
   ln -sfn "vmlinux-$ver" images/vmlinux
+else
+  kernel_file=$(readlink -f images/vmlinux)
+  if [ -f "$kernel_file.sha256" ]; then
+    recorded=$(cat "$kernel_file.sha256")
+    actual=$(sha256sum "$kernel_file" | awk '{print $1}')
+    if [ "$actual" != "$recorded" ]; then
+      echo "error: kernel digest mismatch for $kernel_file" >&2
+      echo "  recorded: $recorded" >&2
+      echo "  actual:   $actual" >&2
+      echo "  delete images/vmlinux-* to re-download the kernel" >&2
+      exit 1
+    fi
+  fi
 fi
 
 # --- 3. Alpine minirootfs + static apk ---------------------------------------
@@ -83,21 +97,32 @@ bash scripts/fetch-verified.sh \
   "$ALPINE_CDN/latest-stable/releases/$ARCH/$minirootfs.sha256" \
   "build/$minirootfs"
 
-apk_ver=$(curl -fsSL --retry 3 "$ALPINE_CDN/$ALPINE_BRANCH/main/$ARCH/APKINDEX.tar.gz" \
-  | tar -xzO APKINDEX | awk '/^P:apk-tools-static$/{p=1} p&&/^V:/{print substr($0,3);p=0}')
+apkindex_url="$ALPINE_CDN/$ALPINE_BRANCH/main/$ARCH/APKINDEX.tar.gz"
+curl -fsSL --retry 3 "$apkindex_url" -o build/APKINDEX.tar.gz
+tar -xzOf build/APKINDEX.tar.gz APKINDEX > build/APKINDEX
+# APKINDEX entries carry C: (checksum) before P:/V: for the same package
+apk_ver=$(awk '/^P:apk-tools-static$/{p=1} p&&/^V:/{print substr($0,3);p=0}' build/APKINDEX)
+apk_sum=$(awk '/^C:/{c=$0} /^P:apk-tools-static$/{print substr(c,3); exit}' build/APKINDEX)
 [ -n "$apk_ver" ] || { echo "error: could not resolve apk-tools-static version" >&2; exit 1; }
+[ -n "$apk_sum" ] || { echo "error: APKINDEX has no apk-tools-static checksum" >&2; exit 1; }
 if [ ! -x build/sbin/apk.static ] || [ "$(cat build/apk.static.version 2>/dev/null || true)" != "$apk_ver" ]; then
   echo "==> downloading apk-tools-static $apk_ver"
   # packages installed by apk.static are signature-verified against the
-  # Alpine keys in the rootfs; this bootstrap binary is not covered by them
+  # Alpine keys in the rootfs; this bootstrap binary is verified against the
+  # checksum APKINDEX publishes for it (same HTTPS CDN) before it is executed
   rm -rf build/sbin
   mkdir -p build/sbin
   curl -fL --retry 3 "$ALPINE_CDN/$ALPINE_BRANCH/main/$ARCH/apk-tools-static-$apk_ver.apk" -o build/apk.apk
+  if ! python3 scripts/verify-apk.py "$apk_sum" build/apk.apk; then
+    rm -f build/apk.apk
+    exit 1
+  fi
   tar -xzOf build/apk.apk sbin/apk.static > build/sbin/apk.static
   chmod +x build/sbin/apk.static
   echo "$apk_ver" > build/apk.static.version
   rm -f build/apk.apk
 fi
+rm -f build/APKINDEX build/APKINDEX.tar.gz
 
 # --- 4. SSH key --------------------------------------------------------------
 if [ ! -f keys/id_ed25519 ]; then

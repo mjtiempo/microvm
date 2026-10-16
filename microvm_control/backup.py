@@ -22,6 +22,7 @@ from microvm_control.lifecycle import (  # shared internals
     _materialize_instance,
     _source_paused,
     _validate_sizes,
+    load_base,
 )
 from microvm_control.output import envelope
 from microvm_control.store import (
@@ -31,15 +32,19 @@ from microvm_control.store import (
     validate_id,
 )
 from microvm_control.util import (
-    atomic_write_json,
     copy_file,
     du_bytes,
     ensure_space,
+    exists_quiet as _exists,
+    mkdir_guarded as _mkdir,
     now_epoch,
     now_iso,
+    rmtree_guarded as _rmtree,
     run,
     sha256_file,
+    size_guarded as _size,
     which,
+    write_json_guarded as _write_json,
 )
 
 MANIFEST = "manifest.json"
@@ -48,35 +53,70 @@ FREESPACE_HEADROOM = 256 * 1024**2
 
 
 # --------------------------------------------------------------------------- #
-# guarded helpers
+# input validation helpers
 # --------------------------------------------------------------------------- #
 
-def _mkdir(path: Path) -> None:
+def _safe_member_name(name) -> bool:
+    """A manifest name must be a plain basename: no separators, no escape.
+
+    Without this, a hostile `manifest.json` points verification at host files
+    (`name: ../..`) or through a symlink member to a host file.
+    """
+    if not isinstance(name, str) or name in ("", ".", ".."):
+        return False
+    if "\x00" in name or "/" in name or "\\" in name:
+        return False
+    return Path(name).name == name
+
+
+def _as_text(value):
+    return value if isinstance(value, str) and value else None
+
+
+def _load_manifest(data: bytes | str) -> dict:
     try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot create {path}", detail=str(exc)) from exc
+        doc = json.loads(data)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise MvError("backup-corrupt", "manifest.json is unreadable", detail=str(exc)) from exc
+    if not isinstance(doc, dict):
+        raise MvError("backup-corrupt", "manifest.json is not a JSON object")
+    return doc
 
 
-def _rmtree(path: Path) -> None:
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except OSError:
-        pass
+def _manifest_bytes(manifest: dict) -> int:
+    """Sum of the uncompressed member sizes (what extraction will write)."""
+    total = 0
+    for entry in manifest.get("files") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            total += max(0, int(entry.get("size") or 0))
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
-def _size(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot stat {path}", detail=str(exc)) from exc
-
-
-def _write_json(path: Path, obj: dict) -> None:
-    try:
-        atomic_write_json(path, obj)
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot write {path}", detail=str(exc)) from exc
+def _validate_staging_files(staging: Path, manifest: dict) -> list[dict]:
+    """Manifest entries that fail path/size/sha256 verification."""
+    bad = []
+    for entry in manifest.get("files") or []:
+        if not isinstance(entry, dict):
+            bad.append({"name": None, "reason": "malformed"})
+            continue
+        name = entry.get("name")
+        if not _safe_member_name(name):
+            bad.append({"name": name, "reason": "unsafe-name"})
+            continue
+        path = staging / name
+        if path.is_symlink():
+            bad.append({"name": name, "reason": "symlink"})
+        elif not path.is_file():
+            bad.append({"name": name, "reason": "missing"})
+        elif path.stat().st_size != entry.get("size"):
+            bad.append({"name": name, "reason": "size"})
+        elif sha256_file(path) != entry.get("sha256"):
+            bad.append({"name": name, "reason": "sha256"})
+    return bad
 
 
 def _staging_dir(home: Path) -> Path:
@@ -105,8 +145,12 @@ def _tar_zstd(staging: Path, out: Path) -> None:
         raise MvError("missing-tool", "tar and zstd are required for tar.zst backups")
     cp = run(["tar", "--zstd", "-cf", str(out), "-C", str(staging), "."])
     if cp.returncode != 0:
-        raise MvError("backup-failed", "tar --zstd failed",
-                      detail=(cp.stderr or cp.stdout).strip()[-500:])
+        detail = (cp.stderr or cp.stdout).strip()[-500:]
+        # compressed size is not knowable up front, so the pre-check cannot
+        # cover it: surface ENOSPC as an actionable hint instead
+        hint = ("free space on the destination, or use --format raw-dir"
+                if "space left" in detail.lower() else None)
+        raise MvError("backup-failed", "tar --zstd failed", hint=hint, detail=detail)
 
 
 def _untar_zstd(archive: Path, staging: Path) -> None:
@@ -114,8 +158,11 @@ def _untar_zstd(archive: Path, staging: Path) -> None:
         raise MvError("missing-tool", "tar and zstd are required to read this backup")
     cp = run(["tar", "--zstd", "-xf", str(archive), "-C", str(staging)])
     if cp.returncode != 0:
+        detail = (cp.stderr or cp.stdout).strip()[-500:]
+        hint = ("free space in the state directory (the restore workspace)"
+                if "space left" in detail.lower() else None)
         raise MvError("backup-corrupt", "the archive could not be read",
-                      detail=(cp.stderr or cp.stdout).strip()[-500:])
+                      hint=hint, detail=detail)
 
 
 def _assert_safe_members(archive: Path) -> None:
@@ -219,10 +266,16 @@ def backup(ns, home: Path):
     ]
     if ns.dry_run:
         raise DryRun(plan)
-    needed = du_bytes(inst.dir) + FREESPACE_HEADROOM
+    # the staging copy needs the disks at their apparent size; the archive
+    # output is compressed, which cannot be predicted, so it gets no arithmetic
+    # guess (a false refusal is worse than a late ENOSPC hint)
+    disk_bytes = _size(inst.dir / "disks" / "rootfs.ext4")
+    if not ns.no_data:
+        disk_bytes += _size(inst.dir / "disks" / "data.ext4")
+    needed = disk_bytes + FREESPACE_HEADROOM
     ensure_space(home, needed, label="the backup staging copy")
-    ensure_space(out_dir, needed if fmt == "raw-dir" else needed // 2,
-                 label=f"the {fmt} archive")
+    if fmt == "raw-dir":
+        ensure_space(out_dir, needed, label="the raw-dir archive")
 
     staging = _staging_dir(home)
     synced = None
@@ -310,55 +363,68 @@ def backup(ns, home: Path):
                           "guest_synced": synced})
 
 
-def _exists(path: Path) -> bool:
-    try:
-        return path.exists()
-    except OSError:
-        return False
-
-
 def restore(ns, home: Path):
     archive = Path(ns.archive).expanduser()
     if not _exists(archive):
         raise MvError("not-found", f"archive {archive} does not exist")
     ensure_home(home)
-    enforce_instance_quota(home)
     staging = _staging_dir(home)
     try:
-        source_bytes = du_bytes(archive)
-        ensure_space(staging, source_bytes * 4 + FREESPACE_HEADROOM,
-                     label="the restore workspace")
         if archive.is_dir():
-            for child in archive.iterdir():
+            children = []
+            for child in sorted(archive.iterdir()):
+                if child.is_symlink():
+                    raise MvError("backup-corrupt",
+                                  f"unsafe member in {archive.name}: {child.name} (symlink)")
+                children.append(child)
+            # a directory copy writes members at their apparent size
+            ensure_space(staging, du_bytes(archive) + FREESPACE_HEADROOM,
+                         label="the restore workspace")
+            for child in children:
                 dest = staging / child.name
                 if child.is_dir():
-                    shutil.copytree(child, dest)
+                    shutil.copytree(child, dest, symlinks=True)
                 else:
                     copy_file(child, dest)
         else:
             _assert_safe_members(archive)
+            # a tar member is written back at its stored (uncompressed) size
+            # and the manifest inside the archive carries exactly those sizes,
+            # so the space can be checked before extraction: running out there
+            # used to be reported as a corrupt archive
+            try:
+                raw_manifest = _tar_read_member(archive, MANIFEST)
+            except MvError as exc:
+                raise MvError("backup-corrupt", "the archive has no readable manifest.json",
+                              detail=exc.detail) from exc
+            pre = _load_manifest(raw_manifest)
+            ensure_space(staging, _manifest_bytes(pre) + FREESPACE_HEADROOM,
+                         label="the restore workspace")
             _untar_zstd(archive, staging)
         manifest_path = staging / MANIFEST
         if not manifest_path.is_file():
             raise MvError("backup-corrupt", "the archive has no manifest.json")
         try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, ValueError) as exc:
+            manifest = _load_manifest(manifest_path.read_text())
+        except OSError as exc:
             raise MvError("backup-corrupt", "manifest.json is unreadable", detail=str(exc)) from exc
 
-        bad = []
-        for entry in manifest.get("files") or []:
-            path = staging / entry["name"]
-            if not path.is_file():
-                bad.append({"name": entry["name"], "reason": "missing"})
-            elif path.stat().st_size != entry["size"]:
-                bad.append({"name": entry["name"], "reason": "size"})
-            elif sha256_file(path) != entry["sha256"]:
-                bad.append({"name": entry["name"], "reason": "sha256"})
+        bad = _validate_staging_files(staging, manifest)
         if bad:
             raise MvError("backup-corrupt",
                           f"{len(bad)} file(s) failed verification",
                           detail={"files": bad})
+        # the disks are read from the staging dir whether they are listed or
+        # not, so refuse an archive that leaves them unverified
+        suffix = ".qcow2" if manifest.get("disk_format") == "qcow2" else ".ext4"
+        required = ["rootfs" + suffix]
+        if (staging / ("data" + suffix)).exists():
+            required.append("data" + suffix)
+        verified_names = {entry.get("name") for entry in manifest.get("files") or []}
+        missing = [name for name in required if name not in verified_names]
+        if missing:
+            raise MvError("backup-corrupt", "required disk members were not verified",
+                          detail={"members": missing})
         if manifest.get("disk_format") == "qcow2":
             _convert_from_qcow(staging)
 
@@ -372,9 +438,13 @@ def restore(ns, home: Path):
         explicit = any(value is not None for value in (ns.tap, ns.ip, ns.gw))
         if explicit and not (ns.tap and ns.ip):
             raise MvError("bad-args", "--tap and --ip must be given together")
-        saved_net = manifest.get("net") or {}
-        inherit = {"tap": saved_net.get("tap"), "ip": saved_net.get("ip"),
-                   "gw": saved_net.get("gw"), "prefix": saved_net.get("prefix"), "index": None}
+        saved_net = manifest.get("net")
+        saved_net = saved_net if isinstance(saved_net, dict) else {}
+        inherit = {"tap": _as_text(saved_net.get("tap")), "ip": _as_text(saved_net.get("ip")),
+                   "gw": _as_text(saved_net.get("gw")),
+                   "prefix": saved_net.get("prefix") if isinstance(saved_net.get("prefix"), int)
+                   else None,
+                   "index": None}
         target = None
         if explicit:
             target = {"tap": ns.tap, "ip": ns.ip, "gw": ns.gw or inherit["gw"],
@@ -388,13 +458,22 @@ def restore(ns, home: Path):
         if ns.dry_run:
             raise DryRun(plan)
 
+        enforce_instance_quota(home)
+        # boot from this home's runtime, never from a path baked into the
+        # archive: a hostile manifest must not execute an arbitrary binary
+        base = load_base(home)
         from microvm_control import lifecycle, netpool
         if target is None:
             target = netpool.allocate(home, new_id) if netpool.configured(home) else dict(inherit)
         if not target.get("tap") or not target.get("ip"):
             raise MvError("bad-args", "no usable network config (archive has none; pass --tap/--ip)")
         has_data = (staging / "data.ext4").is_file()
-        config = manifest.get("config") or {}
+        raw_config = manifest.get("config")
+        config = dict(raw_config) if isinstance(raw_config, dict) else {}
+        config["image_dir"] = str(base["dir"])
+        config["kernel"] = base["kernel"]
+        if base.get("firecracker"):
+            config["firecracker"] = base["firecracker"]
         _validate_sizes(config.get("vcpu"), config.get("mem_mib"))
         allocated = target.get("index") is not None and not explicit
         try:

@@ -14,6 +14,7 @@ mkdir -p "$MICROVM_HOME"
 
 cleanup() {
   kill_own_vms "$MICROVM_HOME" 2>/dev/null || true
+  kill_own_vms "$WORK/home2" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -89,6 +90,27 @@ qc=$(ls "$MICROVM_HOME"/backups/src-qc*.tar.zst | head -1)
 "$MC" start src4 | jq -e '.verified == true' >/dev/null || fail "start src4"
 "$MC" exec src4 -- cat /persist/work/marker.txt | jq -e '.data.stdout | test("hello-backup")' >/dev/null \
   || fail "qcow2 restored data"
+
+say "restore into a second home boots from that home's image set"
+second="$WORK/home2"
+MICROVM_HOME="$second" "$MC" image build | jq -e '.ok' >/dev/null || fail "second image build"
+MICROVM_HOME="$second" "$MC" restore "$archive" --id xh \
+  --tap mvtap5 --ip 172.16.20.2 --gw 172.16.20.1 --prefix 30 \
+  | jq -e '.ok and .verified' >/dev/null || fail "cross-home restore"
+# the archive's config pointed at the first home: the restored meta must
+# resolve onto the second home's image set, or `start` would run a foreign path
+image_dir=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['config']['image_dir'])" \
+  "$second/instances/xh/meta.json")
+case "$image_dir" in
+  "$second"/images/*) ;;
+  *) fail "restored image_dir was not rewritten: $image_dir" ;;
+esac
+MICROVM_HOME="$second" "$MC" start xh | jq -e '.verified == true' >/dev/null || fail "start xh"
+MICROVM_HOME="$second" "$MC" exec xh -- cat /persist/work/marker.txt \
+  | jq -e '.data.stdout | test("hello-backup")' >/dev/null || fail "cross-home restored data"
+MICROVM_HOME="$second" "$MC" stop xh >/dev/null
+MICROVM_HOME="$second" "$MC" delete xh --yes >/dev/null
+MICROVM_HOME="$second" "$MC" list | jq -e '.data.count == 0' >/dev/null || fail "second home cleanup"
 
 say "gc removes trash entries"
 "$MC" --dry-run gc | jq -e '.data.dry_run == true' >/dev/null || fail "gc dry-run"

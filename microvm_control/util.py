@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pwd
+import shutil
 import subprocess
 import tempfile
 import time
@@ -81,6 +82,73 @@ def atomic_write_json(path: Path, obj) -> None:
         raise
 
 
+# --------------------------------------------------------------------------- #
+# guarded filesystem helpers: one definition, one failure policy each
+# --------------------------------------------------------------------------- #
+
+def mkdir_guarded(path: Path, mode: int = 0o700) -> None:
+    """Create a directory tree; a failure is a refusal (`io-failed`)."""
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=mode)
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot create {path}", detail=str(exc)) from exc
+
+
+def rmtree_guarded(path: Path) -> None:
+    """Best-effort recursive removal; a missing path is fine (rollback paths)."""
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def unlink_guarded(path: Path) -> None:
+    """Remove a file; missing is fine, any other failure is a refusal."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot remove {path}", detail=str(exc)) from exc
+
+
+def size_guarded(path: Path) -> int:
+    """Apparent size; a stat failure is a refusal (`io-failed`)."""
+    try:
+        return path.stat().st_size
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot stat {path}", detail=str(exc)) from exc
+
+
+def exists_quiet(path: Path) -> bool:
+    """Existence check that never raises."""
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def write_json_guarded(path: Path, obj) -> None:
+    """Atomic JSON write; the error wording is part of the CLI contract."""
+    try:
+        atomic_write_json(path, obj)
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot write {path}", detail=str(exc)) from exc
+
+
+def chmod_guarded(path: Path, mode: int) -> None:
+    """chmod where failure is a refusal (`io-failed`)."""
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot chmod {path}", detail=str(exc)) from exc
+
+
+def best_effort_chmod(path: Path, mode: int) -> None:
+    """chmod where failure is tolerated; use only for documented best-effort hardening."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def du_bytes(path: Path) -> int:
     total = 0
     if not path.exists():
@@ -124,15 +192,42 @@ def invoking_identity() -> tuple[int, int] | None:
     return None
 
 
+def invoking_user_dir() -> Path | None:
+    """Home directory of the user who ran sudo, resolved, or None.
+
+    Used to decide whether a privileged verb may write state there at all and
+    whether that state may be handed back to the invoking user.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        return None
+    try:
+        pw = pwd.getpwnam(sudo_user)
+    except KeyError:
+        return None
+    return Path(os.path.realpath(pw.pw_dir))
+
+
+def path_within(path: Path, root: Path) -> bool:
+    """True when `path` (symlinks resolved) is `root` or sits inside it."""
+    real = Path(os.path.realpath(path))
+    return real == root or real.is_relative_to(root)
+
+
 def adopt_ownership(paths: list[Path], owner: tuple[int, int] | None) -> None:
-    """Best-effort chown of state written by a privileged verb."""
+    """Best-effort chown of state written by a privileged verb.
+
+    Never follows symlinks: a pre-planted link (e.g. `audit.log -> /etc/shadow`)
+    must not redirect the handover to an arbitrary file.
+    """
     if owner is None:
         return
     uid, gid = owner
     for path in paths:
         try:
-            if path.exists():
-                os.chown(path, uid, gid)
+            if os.path.islink(path) or not os.path.lexists(path):
+                continue
+            os.chown(path, uid, gid, follow_symlinks=False)
         except OSError:
             continue
 

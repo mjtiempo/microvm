@@ -25,7 +25,15 @@ from microvm_control import __version__
 from microvm_control.errors import DryRun, MvError
 from microvm_control.output import envelope
 from microvm_control.store import home_path  # pyright: ignore[reportMissingImports]
-from microvm_control.util import atomic_write_json, now_iso, run, which  # pyright: ignore[reportMissingImports]
+from microvm_control.util import (  # pyright: ignore[reportMissingImports]
+    atomic_write_json,
+    exists_quiet as _exists,
+    mkdir_guarded,
+    now_iso,
+    run,
+    unlink_guarded as _unlink,
+    which,
+)
 
 BASE = "172.16"
 INDEX_START = 1
@@ -74,22 +82,6 @@ def _write_file(path: Path, text: str, mode: int) -> None:
         os.chmod(path, mode)
     except OSError as exc:
         raise MvError("io-failed", f"cannot write {path}", detail=str(exc)) from exc
-
-
-def _unlink(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot remove {path}", detail=str(exc)) from exc
-
-
-def _exists(path: Path) -> bool:
-    try:
-        return path.exists()
-    except OSError:
-        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -442,6 +434,9 @@ def net_install(ns, home: Path):
         raise MvError("bad-args", f"user {user!r} does not exist") from exc
     validate_tap_user(user)
 
+    # create the state dir 0700 before writing net.json: root's mkdir would
+    # otherwise leave it at the umask default until the ownership handover
+    mkdir_guarded(home, 0o700)
     _write_file(SCRIPT_PATH, _render_script(taps, user), 0o755)
     _write_file(UNIT_PATH, _render_unit(), 0o644)
     save_state(home, _new_state(home, taps, user))

@@ -42,6 +42,11 @@ say "create"
 say "start (waits for ssh readiness)"
 "$MC" start demo | jq -e '.ok and .verified == true and .data.ssh_ready_ms > 0' >/dev/null || fail "start"
 
+say "start on an already-running instance is honest about readiness"
+"$MC" start demo --no-wait-ssh \
+  | jq -e '.ok and .verified == false and .data.already_running == true' >/dev/null \
+  || fail "already-running start must report verified: false"
+
 say "start --no-wait-ssh is honest and still becomes reachable"
 "$MC" stop demo | jq -e '.ok' >/dev/null || fail "stop before no-wait start"
 "$MC" start demo --no-wait-ssh \

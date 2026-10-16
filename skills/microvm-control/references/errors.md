@@ -11,7 +11,7 @@ present (failed hashes, API fault message, tap lists, …).
 | `not-found` | instance, snapshot or archive does not exist. `microvm-control list` / `snapshot list <id>` |
 | `already-exists` | the id (or snapshot name) is taken. Delete it or pick another id |
 | `not-running` | the verb needs a running instance. `microvm-control start <id>` |
-| `bad-state` | `meta.json` / `net.json` is unreadable. Inspect the file; re-init the pool or delete the instance |
+| `bad-state` | `meta.json` / `net.json` is unreadable, or a privileged verb's state dir resolves outside the invoking user's home (symlinked `--home`). Inspect the file; re-init the pool or delete the instance |
 | `invalid-id` | id/snapshot name must match `[a-z0-9][a-z0-9-]{0,30}` |
 | `bad-args` | flag combination is invalid (e.g. `--tap` without `--ip`); the hint shows the accepted form |
 | `destructive-needs-yes` | `delete` / `net uninstall` without `--yes` while stdin is not a TTY |
@@ -26,7 +26,7 @@ present (failed hashes, API fault message, tap lists, …).
 | `read-failed` | could not read a file while hashing it |
 | `copy-failed` | disk copy failed (space or permissions) |
 | `disk-full` | not enough free space for a staging copy |
-| `image-missing` | base image missing/incomplete. `microvm-control image build` |
+| `image-missing` | base image missing/incomplete, or an instance records a runtime outside `<home>/images`. `microvm-control image build` |
 | `image-build-failed` | `build.sh`, `mke2fs`, or tar failed; see `<home>/logs/image-build.log` |
 | `image-error` | a `debugfs` command failed on the image |
 | `image-read-failed` | `debugfs` could not read a file out of the image |
@@ -43,7 +43,7 @@ present (failed hashes, API fault message, tap lists, …).
 | `api-timeout` | the API socket did not appear in time; check `status` |
 | `api-error` | Firecracker returned HTTP >= 400; `error.detail` carries the fault message |
 | `boot-failed` | Firecracker exited before SSH was ready; `logs <id> --tail 50` |
-| `resume-failed` | the source could not be resumed after pause (clone/backup); `restart <id>` |
+| `resume-failed` | the source could not be resumed after pause (clone/backup/snapshot create); `restart <id>`. A body error carrying `left_paused` in `error.detail` means the same |
 | `firecracker-error` | the firecracker binary could not be executed; rebuild images |
 | `snapshot-failed` | snapshot files were missing or empty after the API call |
 | `snapshot-version-mismatch` | snapshot was taken with a different Firecracker version; rebuild or clone from disk |
@@ -80,7 +80,7 @@ present (failed hashes, API fault message, tap lists, …).
 | code | meaning / fix |
 | --- | --- |
 | `backup-failed` | archiving failed (tar, `qemu-img`, or a missing artifact) |
-| `backup-corrupt` | the archive is unreadable or a size/sha256 check failed; do not restore it |
+| `backup-corrupt` | the archive is unreadable, has unsafe/escaping member names, or a size/sha256 check failed; do not restore it |
 | `restore-failed` | decoding or materialising the restored instance failed |
 
 ## Other

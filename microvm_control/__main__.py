@@ -23,7 +23,13 @@ from microvm_control import netpool  # pyright: ignore[reportAttributeAccessIssu
 from microvm_control.errors import EXIT_INTERRUPT, EXIT_OK, EXIT_REFUSED, DryRun, MvError
 from microvm_control.output import emit, envelope
 from microvm_control.store import home_path, sudo_home  # pyright: ignore[reportMissingImports]
-from microvm_control.util import adopt_ownership, invoking_identity, now_iso  # pyright: ignore[reportMissingImports]
+from microvm_control.util import (  # pyright: ignore[reportMissingImports]
+    adopt_ownership,
+    invoking_identity,
+    invoking_user_dir,
+    now_iso,
+    path_within,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -252,13 +258,14 @@ def dispatch(ns, home: Path) -> dict | tuple[dict, int]:
 
 def main(argv: list[str] | None = None) -> int:
     ns = build_parser().parse_args(argv)
-    home = resolve_home(ns)
     privileged = ns.verb == "net" and ns.net_verb in ("install", "grow", "uninstall")
     started = time.monotonic()
     ok = False
     code = None
     exit_code = EXIT_OK
+    home: Path | None = None
     try:
+        home = resolve_home(ns)
         result = dispatch(ns, home)
     except DryRun as plan:
         emit(envelope(ok=True, data={"dry_run": True, "plan": plan.plan}), ns.quiet)
@@ -293,7 +300,16 @@ def main(argv: list[str] | None = None) -> int:
         if not ok:
             code = "doctor-failed" if ns.verb == "doctor" else "failed"
     finally:
-        audit.append(home, {
+        # a refused home resolution (a sudo state dir outside the invoking
+        # user's home) must not send the audit write through that same path as
+        # root: fall back to the invoking user's default state dir instead
+        user_dir = invoking_user_dir()
+        audit_home = home
+        if audit_home is None:
+            audit_home = (user_dir / ".local" / "share" / "microvm"
+                          if os.geteuid() == 0 and user_dir is not None
+                          else home_path(ns.home))
+        audit.append(audit_home, {
             "ts": now_iso(),
             "verb": ns.verb,
             "sub": getattr(ns, f"{ns.verb}_verb", None),
@@ -303,9 +319,12 @@ def main(argv: list[str] | None = None) -> int:
             "code": code,
             "duration_ms": round((time.monotonic() - started) * 1000, 1),
         })
-        if privileged and os.geteuid() == 0:
-            # sudo wrote state as root; hand it back to the invoking user so
-            # every later unprivileged verb can read it (see C1 in the review)
+        # sudo wrote state as root; hand it back to the invoking user so every
+        # later unprivileged verb can read it. Only when the home really is
+        # theirs: a symlink or --home pointing elsewhere must not hand over
+        # root-owned state outside their directory.
+        if (privileged and home is not None and os.geteuid() == 0
+                and user_dir is not None and path_within(home, user_dir)):
             adopt_ownership([home, home / netpool.STATE_NAME, home / audit.AUDIT_NAME],
                             invoking_identity())
     return exit_code

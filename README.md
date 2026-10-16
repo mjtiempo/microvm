@@ -39,16 +39,19 @@ microvm-control delete demo --yes          # moves to ~/.local/share/microvm/tra
 microvm-control audit --tail 20            # JSONL of every invocation
 ```
 
-State lives under `~/.local/share/microvm` (mode 0700): `audit.log` is 0600
-and records argv (`MICROVM_AUDIT_ARGS=0` omits it). `sudo microvm-control net
-install` hands the pool state back to the invoking user, so the unprivileged
-verbs keep working afterwards; `doctor` flags a root-owned `net.json` with the
-exact `chown` fix. Each instance gets its own SSH key at create/clone time, so
-the image-baked control key is no longer authorized inside CLI-created
-instances (the legacy `run.sh`/`ssh.sh` flow still uses it). `./build.sh`
-verifies the Firecracker tarball and the Alpine minirootfs against their
-published sha256 (the CI bucket publishes no kernel checksum, so its digest is
-recorded instead).
+State lives under `~/.local/share/microvm` (mode 0700, enforced for every
+verb, including read-only ones): `audit.log` is 0600, records argv
+(`MICROVM_AUDIT_ARGS=0` omits it), and is opened and chmodded through one
+`O_NOFOLLOW` descriptor. `sudo microvm-control net install` hands
+the pool state back to the invoking user — only when the state dir really sits
+inside their home, and never through a symlink; `doctor` flags a root-owned
+`net.json` with the exact `chown` fix. Each instance gets its own SSH key at
+create/clone time, so the image-baked control key is no longer authorized
+inside CLI-created instances (the legacy `run.sh`/`ssh.sh` flow still uses it).
+`./build.sh` verifies the Firecracker tarball and the Alpine minirootfs against
+their published sha256, and `apk.static` against the APKINDEX checksum before
+executing it (the CI bucket publishes no kernel checksum, so its digest is
+recorded on first download and re-checked whenever it is reused).
 
 ### Networking: tap pool (M1)
 

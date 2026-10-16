@@ -381,6 +381,18 @@ archive members, redact audit argv and check free space; the suites kill only
 their own VMs; state is 0700 with a 0600 audit log. Covered by 17 unit tests
 and `tests/accept/m5-hardening.sh`.
 
+**Second review round** (2026-10-17, against 5c11044e): the ownership handover
+is constrained to the invoking user's own home and never follows symlinks
+(`audit.log` is written with `O_NOFOLLOW` + `fchmod`); pid identity matches
+`--api-sock`, so a recycled pid running *another* firecracker is never
+signalled; `restore`/`clone` rewrite `image_dir`/`kernel` onto the local image
+set and manifest member names are validated before hashing (required disks
+must be verified); `_source_paused` reports `resume-failed` and flags
+`left_paused` on body errors; free-space checks use uncompressed member sizes
+(no more `// 2`/`* 4` arithmetic); `apk.static` is verified against the
+APKINDEX checksum before execution and the recorded kernel digest is checked on
+reuse; the guarded FS helpers live once in `util.py`.
+
 ## 13. First actions (next session)
 
 1. Create the package skeleton and the error/envelope contract

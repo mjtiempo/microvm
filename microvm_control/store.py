@@ -5,13 +5,19 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import pwd
 import re
 from contextlib import contextmanager
 from pathlib import Path
 
 from .errors import MvError
-from .util import atomic_write_json, now_epoch
+from .util import (
+    atomic_write_json,
+    best_effort_chmod,
+    invoking_user_dir,
+    mkdir_guarded,
+    now_epoch,
+    path_within,
+)
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 LIVE_STATES = ("starting", "running", "paused")
@@ -30,40 +36,34 @@ def home_path(cli_home: str | None = None) -> Path:
 
 
 def sudo_home(cli_home: str | None = None) -> Path:
-    """State dir for root-only verbs run through sudo: the invoking user's."""
+    """State dir for root-only verbs run through sudo: the invoking user's.
+
+    State written as root is later handed back to that user, so a home that
+    resolves outside the invoking user's home (a planted symlink, `--home
+    /etc`, ...) is refused instead of being written through as root.
+    """
     if cli_home or os.environ.get("MICROVM_HOME"):
-        return home_path(cli_home)
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        try:
-            pw = pwd.getpwnam(sudo_user)
-        except KeyError:
+        home = home_path(cli_home)
+    else:
+        user_dir = invoking_user_dir()
+        if user_dir is None:
             return home_path(cli_home)
-        return (Path(pw.pw_dir) / ".local" / "share" / "microvm").resolve()
-    return home_path(cli_home)
+        home = user_dir / ".local" / "share" / "microvm"
+    user_dir = invoking_user_dir()
+    if user_dir is not None and not path_within(home, user_dir):
+        raise MvError("bad-state",
+                      f"refusing to use {home}: it resolves outside {user_dir}",
+                      hint="remove the symlink, or point --home inside your own directory")
+    return home
 
 
 def ensure_home(home: Path) -> Path:
     for sub in ("instances", "images", "trash", "locks", "logs"):
-        _mkdir(home / sub)
+        mkdir_guarded(home / sub)
     # the home holds audit/meta/net state; keep it private to the owner
-    _chmod(home, 0o700)
-    _chmod(home / "instances", 0o700)
+    best_effort_chmod(home, 0o700)
+    best_effort_chmod(home / "instances", 0o700)
     return home
-
-
-def _mkdir(path: Path, mode: int = 0o700) -> None:
-    try:
-        path.mkdir(parents=True, exist_ok=True, mode=mode)
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot create {path}", detail=str(exc)) from exc
-
-
-def _chmod(path: Path, mode: int) -> None:
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        return
 
 
 def limits(home: Path) -> dict:
@@ -108,6 +108,25 @@ def pid_is_firecracker(pid) -> bool:
     except (OSError, ValueError, TypeError):
         return False
     return comm.startswith("firecracker")
+
+
+def pid_matches(pid, sock: Path | str | None = None) -> bool:
+    """True when pid is a live firecracker and, when `sock` is given, the one
+    started for that instance (`--api-sock <sock>` in its cmdline).
+
+    The comm-only check cannot tell two firecracker processes apart, so a
+    recycled pid would otherwise be treated as "our" VM and signalled.
+    """
+    if not pid_is_firecracker(pid):
+        return False
+    if sock is None:
+        return True
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except (OSError, ValueError, TypeError):
+        return False
+    return str(sock).encode() in argv
 
 
 class Instance:
@@ -164,13 +183,13 @@ class Instance:
 
     def pid_alive(self, meta: dict | None = None) -> bool:
         m = meta if meta is not None else (self.load_meta() if self.exists() else {})
-        return pid_is_firecracker(m.get("pid"))
+        return pid_matches(m.get("pid"), self.sock)
 
     def reconcile(self) -> dict:
         """Never report a live state that the process table contradicts."""
         meta = self.load_meta()
         state = meta.get("state")
-        alive = pid_is_firecracker(meta.get("pid"))
+        alive = pid_matches(meta.get("pid"), self.sock)
         if state in LIVE_STATES and not alive:
             meta["state"] = "dead"
             meta["pid"] = None

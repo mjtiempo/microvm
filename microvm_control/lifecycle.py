@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -33,19 +32,26 @@ from microvm_control.store import (  # pyright: ignore[reportMissingImports]
     enforce_instance_quota,
     ensure_home,
     limits,
-    pid_is_firecracker,
+    pid_matches,
     validate_id,
 )
 from microvm_control.util import (  # pyright: ignore[reportMissingImports]
     atomic_write_json,
     copy_file,
     du_bytes,
+    exists_quiet as _exists,
     free_bytes,
+    mkdir_guarded as _mkdir,
     now_epoch,
     now_iso,
+    rmtree_guarded as _rmtree,
     run,
     sha256_file,
+    size_guarded as _size,
+    unlink_guarded as _unlink_file,
     which,
+    write_json_guarded as _write_json,
+    chmod_guarded as _chmod,
 )
 
 AGENT_DEFAULT_TTL_S = 1800
@@ -59,31 +65,8 @@ DEFAULT_PREFIX = 24
 
 
 # --------------------------------------------------------------------------- #
-# guarded filesystem helpers (each turns OSError into a refusal)
+# local filesystem helpers (the shared guarded set lives in util.py)
 # --------------------------------------------------------------------------- #
-
-def _rmtree(path: Path) -> None:
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except OSError:
-        pass
-
-
-def _unlink_file(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot remove {path}", detail=str(exc)) from exc
-
-
-def _mkdir(path: Path) -> None:
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot create {path}", detail=str(exc)) from exc
-
 
 def _open(path: Path, mode: str) -> IO[Any]:
     try:
@@ -97,27 +80,6 @@ def _write_text(path: Path, text: str) -> None:
         path.write_text(text)
     except OSError as exc:
         raise MvError("io-failed", f"cannot write {path}", detail=str(exc)) from exc
-
-
-def _chmod(path: Path, mode: int) -> None:
-    try:
-        os.chmod(path, mode)
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot chmod {path}", detail=str(exc)) from exc
-
-
-def _size(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot stat {path}", detail=str(exc)) from exc
-
-
-def _exists(path: Path) -> bool:
-    try:
-        return path.exists()
-    except OSError:
-        return False
 
 
 def _kvm_ok() -> bool:
@@ -180,11 +142,24 @@ def load_base(home: Path) -> dict:
 
 
 def _resolve_runtime(home: Path, meta: dict) -> tuple[Path, Path]:
-    """Firecracker + kernel paths recorded by the instance, or the current base."""
+    """Firecracker + kernel paths recorded by the instance, or the current base.
+
+    Only paths inside `<home>/images` are trusted: a tampered meta (or a
+    hostile backup archive restored by an older version) must not turn
+    `start` into executing a binary from an arbitrary directory.
+    """
     config = meta.get("config") or {}
+    images_root = Path(os.path.realpath(home / "images"))
     image_dir = Path(config.get("image_dir") or base_dir(home))
-    fc_binary = image_dir / "firecracker"
     kernel = image_dir / str(config.get("kernel") or "")
+    for path in (image_dir, kernel):
+        real = Path(os.path.realpath(path))
+        if real != images_root and not real.is_relative_to(images_root):
+            raise MvError("image-missing",
+                          f"runtime for '{meta.get('id', '?')}' is outside {images_root}",
+                          hint="the instance's recorded runtime is not from this home; "
+                               "microvm-control image build, or re-create the instance")
+    fc_binary = image_dir / "firecracker"
     if not (fc_binary.is_file() and kernel.is_file()):
         raise MvError("image-missing",
                       f"runtime for '{meta.get('id', '?')}' is incomplete under {image_dir}",
@@ -267,12 +242,17 @@ def make_data_image(dst: Path, size: str) -> None:
     _rmtree(stage)
 
 
-def _kill_process(pid, grace: float = 3.0) -> bool:
+def _kill_process(pid, grace: float = 3.0, *, sock: Path | str | None = None) -> bool:
+    """Signal a process only while it still matches the expected instance.
+
+    With `sock` given, a pid recycled to *another* firecracker (which passes
+    the comm check) is not signalled: its cmdline carries a different
+    `--api-sock`. The check runs again before each signal and while waiting.
+    """
     if not pid:
         return True
     for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2.0)):
-        # never signal a recycled pid: only a live firecracker process is ours
-        if not pid_is_firecracker(pid):
+        if not pid_matches(pid, sock):
             return True
         try:
             os.kill(int(pid), sig)
@@ -280,10 +260,10 @@ def _kill_process(pid, grace: float = 3.0) -> bool:
             return True
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
-            if not pid_is_firecracker(pid):
+            if not pid_matches(pid, sock):
                 return True
             time.sleep(0.05)
-    return not pid_is_firecracker(pid)
+    return not pid_matches(pid, sock)
 
 
 def _guest_sync(inst: Instance, meta: dict):
@@ -295,9 +275,25 @@ def _guest_sync(inst: Instance, meta: dict):
         return False
 
 
+def _resume_error(src: Instance) -> MvError | None:
+    """Resume the source after a pause; the refusal, when there is one."""
+    try:
+        fcapi.FcApi(src.sock).resume()
+        return None
+    except MvError as exc:
+        return exc
+
+
 @contextmanager
 def _source_paused(src: Instance, meta: dict, *, sync: bool = False):
-    """Hold the source lock and pause it (when running) for a disk copy."""
+    """Hold the source lock and pause it (when running) for a disk copy.
+
+    On success the instance is always resumed; if that resume fails the caller
+    gets `resume-failed` (the guest may be frozen: `restart <id>`). When the
+    body itself failed, the resume is still attempted and a resume failure is
+    attached to the propagating error (`left_paused` in `error.detail`) so the
+    operator is not told the copy failed while the VM silently stays frozen.
+    """
     with src.lock():
         running = src.pid_alive(meta)
         synced = _guest_sync(src, meta) if (running and sync) else None
@@ -307,16 +303,26 @@ def _source_paused(src: Instance, meta: dict, *, sync: bool = False):
             paused = True
         try:
             yield {"running": running, "paused": paused, "synced": synced}
-        except BaseException:
+        except BaseException as exc:
             if paused:
-                try:
-                    fcapi.FcApi(src.sock).resume()
-                except MvError:
-                    pass
+                resume_exc = _resume_error(src)
+                if resume_exc is not None and isinstance(exc, MvError):
+                    note = {"resume_error": str(resume_exc), "left_paused": True}
+                    exc.detail = ({"error": exc.detail, **note} if exc.detail is not None
+                                  else note)
+                    if exc.hint is None:
+                        exc.hint = f"microvm-control restart {src.id}"
             raise
         else:
             if paused:
-                fcapi.FcApi(src.sock).resume()
+                resume_exc = _resume_error(src)
+                if resume_exc is not None:
+                    raise MvError(
+                        "resume-failed",
+                        f"could not resume '{src.id}' after the pause",
+                        hint=f"microvm-control restart {src.id}",
+                        detail=str(resume_exc),
+                    ) from resume_exc
 
 
 def _validate_sizes(vcpu, mem_mib) -> None:
@@ -366,7 +372,7 @@ def _stop_instance(inst: Instance, meta: dict, timeout: float):
         time.sleep(0.1)
     if inst.pid_alive(meta):
         graceful = False
-        _kill_process(meta["pid"], grace=5)
+        _kill_process(meta["pid"], grace=5, sock=inst.sock)
     meta["state"] = "stopped"
     meta["pid"] = None
     meta["stopped_at"] = now_iso()
@@ -421,13 +427,6 @@ def _disk_signature(path: Path) -> dict:
     except OSError as exc:
         raise MvError("io-failed", f"cannot stat {path}", detail=str(exc)) from exc
     return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
-
-
-def _write_json(path: Path, obj: dict) -> None:
-    try:
-        atomic_write_json(path, obj)
-    except OSError as exc:
-        raise MvError("io-failed", f"cannot write {path}", detail=str(exc)) from exc
 
 
 def _fsck(image: Path, *, journal_only: bool = False) -> None:
@@ -592,8 +591,6 @@ def image_build(ns, home: Path):
 def create(ns, home: Path):
     validate_id(ns.id)
     ensure_home(home)
-    enforce_instance_quota(home)
-    _validate_sizes(ns.vcpu, ns.mem_mib)
     base = load_base(home)
     ttl = ns.ttl
     if ttl is None and os.environ.get("MICROVM_AGENT") == "1":
@@ -611,20 +608,26 @@ def create(ns, home: Path):
     elif ns.dry_run:
         target = netpool.plan(home, ns.id) or legacy
     else:
-        target = netpool.allocate(home, ns.id) if netpool.configured(home) else legacy
-    allocated = target.get("index") is not None and not explicit
+        target = None  # allocated after the dry-run/quota checks
+    allocated = False
+    planned = target if target is not None else legacy
 
     plan = [
         f"reserve {inst.dir}",
         f"copy {base['dir']}/{base['rootfs']} -> {inst.dir}/disks/rootfs.ext4 (reflink)",
         f"{'fresh' if ns.fresh_data else 'copy'} data -> {inst.dir}/disks/data.ext4",
-        f"network {target['tap']} guest {target['ip']}/{target['prefix']} gw {target['gw']}"
-        + (f" (pool index {target['index']})" if target.get("index") else ""),
+        f"network {planned['tap']} guest {planned['ip']}/{planned['prefix']} gw {planned['gw']}"
+        + (f" (pool index {planned['index']})" if planned.get("index") else ""),
         f"fresh instance ssh key + host keys, hostname={ns.id}",
         f"write {inst.meta_path}",
     ]
     if ns.dry_run:
         raise DryRun(plan)
+    _validate_sizes(ns.vcpu, ns.mem_mib)
+    enforce_instance_quota(home)
+    if target is None:
+        target = netpool.allocate(home, ns.id) if netpool.configured(home) else legacy
+    allocated = target.get("index") is not None and not explicit
     config = {
         "vcpu": ns.vcpu,
         "mem_mib": ns.mem_mib,
@@ -659,7 +662,10 @@ def start(ns, home: Path):
     wait_ssh = not ns.no_wait_ssh
     timeout = ns.timeout_verb or ns.timeout
     if meta.get("state") == "running" and inst.pid_alive(meta):
-        ssh_ready = sshx.probe(inst.key, inst.known_hosts, meta["net"]["ip"]) if wait_ssh else None
+        # with --no-wait-ssh the reply must still say verified: false, not
+        # omit the key: an agent branching on `verified === false` must never
+        # see a missing field on a success reply
+        ssh_ready = sshx.probe(inst.key, inst.known_hosts, meta["net"]["ip"]) if wait_ssh else False
         return envelope(instance=inst.summary(meta), verified=ssh_ready, effect="unverifiable",
                         rung="api", data={"already_running": True, "ssh_ready": ssh_ready})
     fc_binary, kernel = _resolve_runtime(home, meta)
@@ -733,7 +739,7 @@ def start(ns, home: Path):
                                          timeout=timeout,
                                          cancel=lambda: not inst.pid_alive(meta))
         except MvError as exc:
-            _kill_process(meta["pid"], grace=3)
+            _kill_process(meta["pid"], grace=3, sock=inst.sock)
             meta["state"] = "dead"
             meta["pid"] = None
             inst.save_meta(meta)
@@ -908,7 +914,7 @@ def _delete_instance(inst: Instance, home: Path, *, purge: bool, force: bool,
         meta = inst.reconcile()
         if inst.pid_alive(meta):
             if force:
-                _kill_process(meta["pid"], grace=5)
+                _kill_process(meta["pid"], grace=5, sock=inst.sock)
             else:
                 _stop_instance(inst, meta, timeout)
     freed = du_bytes(inst.dir)
@@ -1060,26 +1066,37 @@ def clone(ns, home: Path):
     elif ns.dry_run:
         target = netpool.plan(home, ns.id) or inherit
     else:
-        target = netpool.allocate(home, ns.id) if netpool.configured(home) else inherit
-    allocated = target.get("index") is not None and not explicit
-    config = dict(smeta.get("config") or {})
+        target = None  # allocated only after the dry-run/quota checks
+    allocated = False
+    planned = target if target is not None else inherit
+    # the clone boots on this home's runtime, never on a path inherited from
+    # the source meta (which a tampered meta could point anywhere)
+    base = load_base(home)
+    config = dict(smeta.get("config") or {}) if isinstance(smeta.get("config"), dict) else {}
+    config["image_dir"] = str(base["dir"])
+    config["kernel"] = base["kernel"]
+    if base.get("firecracker"):
+        config["firecracker"] = base["firecracker"]
     if ns.vcpu:
         config["vcpu"] = ns.vcpu
     if ns.mem_mib:
         config["mem_mib"] = ns.mem_mib
-    _validate_sizes(config.get("vcpu"), config.get("mem_mib"))
-    enforce_instance_quota(home)
     running = src.pid_alive(smeta)
     dst = Instance(home, ns.id)
     plan = [
         f"source {src.id} ({'running: pause, copy, resume' if running else 'stopped'})",
         f"copy disks -> {dst.dir}/disks (reflink when possible)",
-        f"network {target['tap']} guest {target['ip']}/{target['prefix']} gw {target['gw']}"
-        + (f" (pool index {target['index']})" if target.get("index") else ""),
+        f"network {planned['tap']} guest {planned['ip']}/{planned['prefix']} gw {planned['gw']}"
+        + (f" (pool index {planned['index']})" if planned.get("index") else ""),
         f"fresh identity for {ns.id} (hostname, ssh key, host keys)",
     ]
     if ns.dry_run:
         raise DryRun(plan)
+    _validate_sizes(config.get("vcpu"), config.get("mem_mib"))
+    enforce_instance_quota(home)
+    if target is None:
+        target = netpool.allocate(home, ns.id) if netpool.configured(home) else inherit
+    allocated = target.get("index") is not None and not explicit
     result = None
     try:
         with _source_paused(src, smeta):
@@ -1094,8 +1111,6 @@ def clone(ns, home: Path):
         if allocated:
             netpool.release(home, ns.id)
         raise
-    if result is None:
-        raise MvError("internal", "clone produced no result")
     if result is None:
         raise MvError("internal", "clone produced no result")
     inst, meta, ident, mode = result
@@ -1139,26 +1154,12 @@ def snapshot_create(ns, home: Path):
     if ns.dry_run:
         raise DryRun(plan)
     _mkdir(snap_dir)
-    api = fcapi.FcApi(inst.sock)
-    paused = False
-    error = None
-    with inst.lock():
-        try:
-            api.pause()
-            paused = True
-            api.snapshot_create(snapshot_path=vmstate, mem_path=mem)
-        except MvError as exc:
-            error = exc
-        if paused:
-            try:
-                api.resume()
-            except MvError as exc:
-                if error is None:
-                    error = MvError("resume-failed", f"could not resume '{ns.id}' after snapshotting",
-                                    hint=f"microvm-control restart {ns.id}", detail=str(exc))
-    if error is not None:
+    try:
+        with _source_paused(inst, meta):
+            fcapi.FcApi(inst.sock).snapshot_create(snapshot_path=vmstate, mem_path=mem)
+    except BaseException:
         _rmtree(snap_dir)
-        raise error
+        raise
     snap_meta = {
         "schema": 1, "name": ns.name, "created_at": now_iso(), "type": "Full",
         "firecracker": version, "kernel": meta["config"]["kernel"],
@@ -1267,9 +1268,9 @@ def snapshot_load(ns, home: Path):
                               mem_path=snap_dir / "mem.bin")
             sshx.wait_ready(inst.key, inst.known_hosts, meta["net"]["ip"],
                             timeout=timeout,
-                            cancel=lambda: not pid_is_firecracker(proc.pid))
+                            cancel=lambda: not pid_matches(proc.pid, inst.sock))
         except MvError as exc:
-            _kill_process(proc.pid, grace=3)
+            _kill_process(proc.pid, grace=3, sock=inst.sock)
             meta["state"] = "dead"
             meta["pid"] = None
             inst.save_meta(meta)
