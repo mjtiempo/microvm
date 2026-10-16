@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# M3 acceptance, rootless: backup a running instance, verify manifests, restore
+# with hash verification and --verify boot, corrupt-archive refusal, --no-data,
+# and the qcow2 disk encoding.
+# Usage: tests/accept/m3-backup.sh
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")/../.."
+
+MC="$PWD/microvm-control"
+WORK=$(mktemp -d "$HOME/.cache/microvm-accept-m3.XXXXXX")
+export MICROVM_HOME="$WORK/home" MC WORK
+mkdir -p "$MICROVM_HOME"
+
+cleanup() {
+  pkill -x firecracker 2>/dev/null || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+printf '\n== image build\n'
+"$MC" image build | jq -e '.ok == true' >/dev/null
+
+inner="$WORK/inner.sh"
+cat > "$inner" <<'EOS'
+set -euo pipefail
+ip link set lo up
+python3 -c "from microvm_control import netpool; print(netpool._render_script(5, 'root'))" \
+  > "$WORK/net-setup.sh"
+sh "$WORK/net-setup.sh" up
+
+say() { printf '\n== %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+say "net init (5 taps)"
+"$MC" net init --taps 5 >/dev/null
+
+say "seed a running instance"
+"$MC" create src >/dev/null
+"$MC" start src | jq -e '.verified == true' >/dev/null || fail "start src"
+"$MC" exec src -- sh -c 'echo hello-backup > /persist/work/marker.txt' >/dev/null
+
+say "backup a running instance (tar.zst, pause + sha256 manifest)"
+"$MC" backup src --name b1 \
+  | jq -e '.ok and .verified and .data.bytes > 0 and (.data.files | length == 3)' >/dev/null \
+  || fail "backup"
+archive=$(ls "$MICROVM_HOME"/backups/src-b1*.tar.zst | head -1)
+[ -f "$archive" ] || fail "archive missing"
+
+say "restore with --verify boot"
+"$MC" restore "$archive" --id src2 --verify \
+  | jq -e '.ok and .verified and .data.boot_verified == true and .data.files_verified == 3' >/dev/null \
+  || fail "restore"
+"$MC" exec src2 -- hostname | jq -e '(.data.stdout | sub("\\n$"; "")) == "src2"' >/dev/null || fail "restored hostname"
+"$MC" exec src2 -- cat /persist/work/marker.txt | jq -e '.data.stdout | test("hello-backup")' >/dev/null \
+  || fail "restored /persist data"
+"$MC" exec src -- true | jq -e '.data.exit_code == 0' >/dev/null || fail "source unusable after backup"
+
+say "a corrupt archive is refused"
+cp "$archive" "$WORK/corrupt.tar.zst"
+python3 - "$WORK/corrupt.tar.zst" <<'PY'
+import sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+data[len(data) // 2] ^= 0xFF
+open(path, "wb").write(data)
+PY
+if "$MC" restore "$WORK/corrupt.tar.zst" --id bad >"$WORK/corrupt.json" 2>/dev/null; then
+  fail "corrupt archive restored"
+fi
+jq -e '.error.code == "backup-corrupt"' "$WORK/corrupt.json" >/dev/null || fail "wrong corrupt-archive code"
+
+say "backup --no-data + restore starts with a fresh /persist"
+"$MC" backup src --name nodata --no-data | jq -e '.ok and (.data.files | length == 2)' >/dev/null \
+  || fail "no-data backup"
+nodata=$(ls "$MICROVM_HOME"/backups/src-nodata*.tar.zst | head -1)
+"$MC" restore "$nodata" --id src3 | jq -e '.ok and .verified' >/dev/null || fail "restore no-data"
+"$MC" start src3 | jq -e '.verified == true' >/dev/null || fail "start src3"
+"$MC" exec src3 -- sh -c 'test ! -e /persist/work/marker.txt && echo fresh' \
+  | jq -e '.data.stdout | test("fresh")' >/dev/null || fail "/persist not fresh"
+
+say "qcow2 disk encoding round trip"
+"$MC" backup src --name qc --format qcow2 \
+  | jq -e '.ok and .data.disk_format == "qcow2"' >/dev/null || fail "qcow2 backup"
+qc=$(ls "$MICROVM_HOME"/backups/src-qc*.tar.zst | head -1)
+"$MC" restore "$qc" --id src4 | jq -e '.ok and .data.disk_format == "qcow2"' >/dev/null || fail "qcow2 restore"
+"$MC" start src4 | jq -e '.verified == true' >/dev/null || fail "start src4"
+"$MC" exec src4 -- cat /persist/work/marker.txt | jq -e '.data.stdout | test("hello-backup")' >/dev/null \
+  || fail "qcow2 restored data"
+
+say "gc removes trash entries"
+"$MC" --dry-run gc | jq -e '.data.dry_run == true' >/dev/null || fail "gc dry-run"
+
+say "cleanup"
+for i in src src2 src3 src4; do
+  "$MC" stop "$i" >/dev/null 2>&1 || true
+  "$MC" delete "$i" --yes >/dev/null
+done
+"$MC" list | jq -e '.data.count == 0' >/dev/null || fail "cleanup"
+
+printf '\nM3 BACKUP/RESTORE ACCEPTANCE PASSED\n'
+EOS
+
+unshare -Urn bash "$inner"

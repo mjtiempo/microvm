@@ -10,15 +10,20 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import traceback
+from pathlib import Path
 
 # The pyright language server in this session does not index modules added
 # mid-session; CLI pyright and python3 resolve all of these cleanly.
 from microvm_control import __version__, lifecycle  # pyright: ignore[reportAttributeAccessIssue]
+from microvm_control import audit  # pyright: ignore[reportAttributeAccessIssue]
+from microvm_control import backup  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control import netpool  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control.errors import EXIT_INTERRUPT, EXIT_OK, EXIT_REFUSED, DryRun, MvError
 from microvm_control.output import emit, envelope
 from microvm_control.store import home_path, sudo_home  # pyright: ignore[reportMissingImports]
+from microvm_control.util import now_iso  # pyright: ignore[reportMissingImports]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +59,80 @@ def build_parser() -> argparse.ArgumentParser:
     p_net_grow = net_sub.add_parser("grow", help="resize the pool (root)")
     p_net_grow.add_argument("--taps", type=int, required=True)
     net_sub.add_parser("uninstall", help="remove the unit, taps and pool state (root)")
+
+    p_clone = sub.add_parser("clone", help="copy an instance (a running source is paused for the copy)")
+    p_clone.add_argument("source")
+    p_clone.add_argument("id")
+    p_clone.add_argument("--fresh-data", action="store_true",
+                          help="start the clone with an empty /persist")
+    p_clone.add_argument("--vcpu", type=int, default=None)
+    p_clone.add_argument("--mem", type=int, default=None, metavar="MIB", dest="mem_mib")
+    p_clone.add_argument("--ttl", type=int, metavar="SEC")
+    p_clone.add_argument("--tap", default=None)
+    p_clone.add_argument("--ip", default=None)
+    p_clone.add_argument("--gw", default=None)
+    p_clone.add_argument("--prefix", type=int, default=None)
+
+    p_snap = sub.add_parser("snapshot", help="memory snapshots (pause/snapshot/resume)")
+    snap_sub = p_snap.add_subparsers(dest="snapshot_verb", required=True)
+    ps_create = snap_sub.add_parser("create", help="snapshot a running instance")
+    ps_create.add_argument("id")
+    ps_create.add_argument("--name", required=True)
+    ps_list = snap_sub.add_parser("list", help="list snapshots of an instance")
+    ps_list.add_argument("id")
+    ps_delete = snap_sub.add_parser("delete", help="delete a snapshot")
+    ps_delete.add_argument("id")
+    ps_delete.add_argument("--name", required=True)
+    ps_load = snap_sub.add_parser("load", help="restore an instance from a snapshot")
+    ps_load.add_argument("id")
+    ps_load.add_argument("--name", required=True)
+    ps_load.add_argument("--force", action="store_true",
+                         help="load even when a disk image changed size since the snapshot")
+    ps_load.add_argument("--timeout", type=float, default=None, dest="timeout_verb", metavar="SEC")
+
+    p_reap = sub.add_parser("reap", help="delete expired instances (TTL)")
+    p_reap.add_argument("--older-than", type=float, default=None, metavar="SEC",
+                        help="also reap instances stopped longer than SEC")
+    p_reap.add_argument("--timeout", type=float, default=None, dest="timeout_verb", metavar="SEC")
+
+    p_gc = sub.add_parser("gc", help="remove old trash entries, exec artifacts and snapshots")
+    p_gc.add_argument("--trash-days", type=int, default=None)
+    p_gc.add_argument("--artifact-days", type=int, default=None)
+    p_gc.add_argument("--snapshot-days", type=int, default=None,
+                      help="prune snapshots older than N days (disabled by default)")
+
+    p_browser = sub.add_parser("browser", help="headless Chromium in the guest (dom/screenshot/pdf)")
+    p_browser.add_argument("id")
+    browser_action = p_browser.add_mutually_exclusive_group(required=True)
+    browser_action.add_argument("--dom", metavar="URL", help="print the rendered DOM")
+    browser_action.add_argument("--screenshot", metavar="URL", help="save a PNG")
+    browser_action.add_argument("--pdf", metavar="URL", help="save a PDF")
+    p_browser.add_argument("--out", default=None, metavar="FILE")
+    p_browser.add_argument("--window-size", default="1280,800", metavar="W,H")
+    p_browser.add_argument("--timeout", type=float, default=None, dest="timeout_verb", metavar="SEC")
+
+    p_backup = sub.add_parser("backup", help="archive an instance (disks + meta + sha256 manifest)")
+    p_backup.add_argument("id")
+    p_backup.add_argument("--out", default=None, metavar="DIR")
+    p_backup.add_argument("--name", default=None)
+    p_backup.add_argument("--no-data", action="store_true", help="exclude /persist")
+    p_backup.add_argument("--no-pause", action="store_true",
+                          help="copy a running instance without pausing it first")
+    p_backup.add_argument("--format", choices=backup.BACKUP_FORMATS, default="tar.zst")
+
+    p_restore = sub.add_parser("restore", help="restore an instance from a backup archive")
+    p_restore.add_argument("archive")
+    p_restore.add_argument("--id", default=None,
+                           help="new instance id (default: <original>-r<ts>)")
+    p_restore.add_argument("--verify", dest="verify_boot", action="store_true",
+                           help="boot the restored instance and wait for ssh")
+    p_restore.add_argument("--fresh-data", action="store_true")
+    p_restore.add_argument("--ttl", type=int, metavar="SEC")
+    p_restore.add_argument("--tap", default=None)
+    p_restore.add_argument("--ip", default=None)
+    p_restore.add_argument("--gw", default=None)
+    p_restore.add_argument("--prefix", type=int, default=None)
+    p_restore.add_argument("--timeout", type=float, default=None, dest="timeout_verb", metavar="SEC")
 
     p_create = sub.add_parser("create", help="create an instance (disk copies + identity)")
     p_create.add_argument("id")
@@ -118,21 +197,41 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("caps", help="what this host/install can do")
     sub.add_parser("doctor", help="preflight checks (exit 1 when a required check fails)")
 
+    p_audit = sub.add_parser("audit", help="recent invocations (JSONL)")
+    p_audit.add_argument("--tail", type=int, default=50)
+
     return parser
 
 
-def dispatch(ns) -> dict | tuple[dict, int]:
+def resolve_home(ns) -> Path:
     home = home_path(ns.home)
     if ns.verb == "net" and ns.net_verb in ("install", "grow", "uninstall"):
         home = sudo_home(ns.home)
+    return home
+
+
+def dispatch(ns, home: Path) -> dict | tuple[dict, int]:
     if ns.verb == "image":
         if ns.image_verb == "build":
             return lifecycle.image_build(ns, home)
         raise MvError("bad-args", f"unknown image verb: {ns.image_verb}")
     if ns.verb == "net":
         return netpool.dispatch(ns, home)
+    if ns.verb == "snapshot":
+        snapshot_handlers = {
+            "create": lifecycle.snapshot_create,
+            "list": lifecycle.snapshot_list,
+            "delete": lifecycle.snapshot_delete,
+            "load": lifecycle.snapshot_load,
+        }
+        return snapshot_handlers[ns.snapshot_verb](ns, home)
     handlers = {
         "create": lifecycle.create,
+        "clone": lifecycle.clone,
+        "reap": lifecycle.reap,
+        "gc": lifecycle.gc,
+        "backup": backup.backup,
+        "restore": backup.restore,
         "start": lifecycle.start,
         "stop": lifecycle.stop,
         "restart": lifecycle.restart,
@@ -143,41 +242,67 @@ def dispatch(ns) -> dict | tuple[dict, int]:
         "ssh": lifecycle.ssh_shell,
         "logs": lifecycle.logs,
         "delete": lifecycle.delete,
+        "browser": lifecycle.browser,
         "caps": lifecycle.caps,
         "doctor": lifecycle.doctor,
+        "audit": audit.verb,
     }
     return handlers[ns.verb](ns, home)
 
 
 def main(argv: list[str] | None = None) -> int:
     ns = build_parser().parse_args(argv)
+    home = resolve_home(ns)
+    started = time.monotonic()
+    ok = False
+    code = None
+    exit_code = EXIT_OK
     try:
-        result = dispatch(ns)
+        result = dispatch(ns, home)
     except DryRun as plan:
         emit(envelope(ok=True, data={"dry_run": True, "plan": plan.plan}), ns.quiet)
-        return EXIT_OK
+        ok = True
+        code = "dry-run"
     except MvError as exc:
         emit(envelope(ok=False, error=exc.to_json()), ns.quiet)
         sys.stderr.write(f"ERR[{exc.code}]: {exc.message}\n")
         if exc.hint:
             sys.stderr.write(f"  hint: {exc.hint}\n")
-        return EXIT_REFUSED
+        code = exc.code
+        exit_code = EXIT_REFUSED
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")
-        return EXIT_INTERRUPT
+        code = "interrupt"
+        exit_code = EXIT_INTERRUPT
     except BrokenPipeError:
+        code = "broken-pipe"
         return EXIT_OK
     except Exception as exc:  # last-resort refusal; MICROVM_DEBUG=1 for a traceback
         if os.environ.get("MICROVM_DEBUG") == "1":
             traceback.print_exc()
         emit(envelope(ok=False, error={"code": "internal", "message": str(exc)}), ns.quiet)
         sys.stderr.write(f"ERR[internal]: {exc}\n")
-        return EXIT_REFUSED
-    code = EXIT_OK
-    if isinstance(result, tuple):
-        result, code = result
-    emit(result, ns.quiet)
-    return code
+        code = "internal"
+        exit_code = EXIT_REFUSED
+    else:
+        if isinstance(result, tuple):
+            result, exit_code = result
+        emit(result, ns.quiet)
+        ok = exit_code == EXIT_OK
+        if not ok:
+            code = "doctor-failed" if ns.verb == "doctor" else "failed"
+    finally:
+        audit.append(home, {
+            "ts": now_iso(),
+            "verb": ns.verb,
+            "sub": getattr(ns, f"{ns.verb}_verb", None),
+            "instance": getattr(ns, "id", None) or getattr(ns, "source", None),
+            "argv": sys.argv[1:],
+            "ok": ok,
+            "code": code,
+            "duration_ms": round((time.monotonic() - started) * 1000, 1),
+        })
+    return exit_code
 
 
 if __name__ == "__main__":

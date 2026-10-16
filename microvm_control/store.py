@@ -79,6 +79,7 @@ class Instance:
         self.fc_log = self.dir / "run" / "firecracker.log"
         self.key = self.dir / "keys" / "id_ed25519"
         self.known_hosts = self.dir / "ssh" / "known_hosts"
+        self.snapshots_dir = self.dir / "snapshots"
 
     def exists(self) -> bool:
         return self.meta_path.is_file()

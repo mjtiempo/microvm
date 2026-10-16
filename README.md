@@ -10,24 +10,33 @@ No host root is needed to build the images (a user namespace is used for
 staging, so the guest sees proper root-owned files). Root is only needed once
 to create the tap device + NAT.
 
-## Control CLI — `microvm-control` (M0)
+## Control CLI — `microvm-control`
 
 `microvm-control` is the agent-facing entry point: one verb per process, one
 JSON object per call, `ERR[code]` refusals (exit 1, usage 2), `--dry-run`, and
-state under `~/.local/share/microvm` (`MICROVM_HOME` overrides). M0 verbs:
+state under `~/.local/share/microvm` (`MICROVM_HOME` overrides). The agent
+skill and full references live in `skills/microvm-control/` (installed at
+`~/.pi/agent/skills/microvm-control`).
 
 ```bash
 microvm-control image build                # once: build/import the base image set
 microvm-control doctor | jq .data.checks   # preflight
-microvm-control create demo --ttl 3600     # reflinked disks + fresh ssh host keys
+microvm-control create demo --ttl 3600     # reflinked disks, per-instance ssh key + host keys
 microvm-control start demo                 # boots via the API, waits for ssh readiness
 microvm-control exec demo -- uname -a      # exit_code is data, not a refusal
+microvm-control browser demo --screenshot https://example.com --out shot.png
 microvm-control cp demo:/etc/alpine-release ./alpine-release
+microvm-control clone demo demo2           # running source: pause/copy/resume
+microvm-control snapshot create demo --name s1 && microvm-control snapshot load demo --name s1
+microvm-control backup demo --name nightly # tar.zst + sha256 manifest
+microvm-control restore <home>/backups/demo-nightly.tar.zst --id demo3 --verify
 microvm-control logs demo --tail 50
 microvm-control status demo --probe
 microvm-control stop demo && microvm-control restart demo
 microvm-control list | jq .data.instances
+microvm-control reap && microvm-control gc --snapshot-days 7
 microvm-control delete demo --yes          # moves to ~/.local/share/microvm/trash
+microvm-control audit --tail 20            # JSONL of every invocation
 ```
 
 ### Networking: tap pool (M1)
@@ -49,9 +58,11 @@ refuses a second concurrent instance (`net-conflict`). `microvm-control net
 init --taps 8` defines the pool in state without root (useful for tests and
 for inspecting allocation before installing).
 
-`tests/accept/m0.sh` (shared tap) and `tests/accept/m1-pool.sh` (pool, two
-concurrent VMs) exercise the whole lifecycle rootless, in a private
-user+network namespace.
+Acceptance suites run the real stack rootless (private user+network
+namespace): `tests/accept/m0.sh` (shared-tap lifecycle), `m1-pool.sh` (pool,
+two concurrent VMs), `m2-clone.sh` (per-instance keys, snapshots, cold/live
+clone, browser, reap), `m3-backup.sh` (backup/restore, corrupt-archive
+refusal, qcow2) and `m4-agent.sh` (docs↔CLI sync, audit, reply shapes).
 
 ## Quickstart (shell scripts)
 
@@ -132,15 +143,14 @@ VMs — ext4 is not cluster-safe.
 ## Layout
 
 ```text
-build.sh    fetch + stage Alpine guest, build rootfs/persist ext4 images
-net.sh      tap device + NAT (sudo, once per boot)
-run.sh      launch firecracker with vm.json
-ssh.sh      ssh into the guest
-test.sh     rootless smoke test (no sudo, uses unshare)
-vm.json     firecracker config: kernel, drives, 2 vcpu / 2 GiB, tap, logger
-images/     firecracker, jailer, vmlinux, rootfs.ext4, persist.ext4
-keys/       guest SSH keypair
-run/        api socket + firecracker.log + test console logs
+microvm-control      CLI launcher (repo on PYTHONPATH)
+microvm_control/     python package: store, fcapi, identity, netpool,
+                     lifecycle, backup, sshx, audit, __main__
+skills/microvm-control/  agent skill + references/verbs.md + references/errors.md
+tests/accept/        m0..m4 rootless acceptance suites
+build.sh net.sh run.sh ssh.sh test.sh   legacy shell flow (still working)
+vm.json              firecracker config for the legacy flow
+images/ keys/ run/   legacy build artifacts
 ```
 
 ## Tuning
@@ -151,9 +161,9 @@ run/        api socket + firecracker.log + test console logs
 - Versions: `FC_VERSION=v1.17.0`, `ALPINE_VERSION=3.24.2`,
   `ALPINE_BRANCH=v3.24`, `VM_PASSWORD=...` (unset = latest releases)
 - Clean slate: `rm -rf images keys run build && ./build.sh`
-- Snapshot/restore (fast cold starts) is available via the Firecracker API
-  socket (`run/firecracker.sock`); the disk-image approach here is the simpler
-  alternative.
+- Snapshots, clone, backup/restore and the browser helper are provided by
+  `microvm-control` (see above); the shell flow keeps a single running VM on
+  `fc-tap`.
 
 ## Caveats
 

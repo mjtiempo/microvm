@@ -90,8 +90,9 @@ def _generate_host_keys(workdir: Path, instance: str) -> Path:
 
 
 def inject_identity(rootfs: Path, *, instance: str, hostname: str, ip: str,
-                    gw: str, prefix: int, workdir: Path) -> dict:
-    """Rewrite identity files and host keys inside the copied rootfs image.
+                    gw: str, prefix: int, workdir: Path,
+                    authorized_keys: bytes | None = None) -> dict:
+    """Rewrite identity files, host keys and the login key inside the image.
 
     Returns the injected values plus the known_hosts lines for pinning.
     """
@@ -120,6 +121,13 @@ def inject_identity(rootfs: Path, *, instance: str, hostname: str, ip: str,
     write_file(rootfs, "/etc/network/interfaces", interfaces.encode())
     write_file(rootfs, "/etc/microvm/identity.env", identity_env.encode())
     ensure_dir(rootfs, "/etc/ssh")
+
+    if authorized_keys is not None:
+        ensure_dir(rootfs, "/root/.ssh")
+        # 040000 = S_IFDIR; 0100000 would turn the directory into a regular file
+        for field, value in (("mode", "040700"), ("uid", "0"), ("gid", "0")):
+            _debugfs(rootfs, [f"sif /root/.ssh {field} {value}"], write=True, check=False)
+        write_file(rootfs, "/root/.ssh/authorized_keys", authorized_keys, "0100600")
 
     for stale in STALE_HOST_KEY_TYPES:
         for suffix in ("", ".pub"):

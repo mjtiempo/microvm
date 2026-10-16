@@ -118,5 +118,22 @@ class FcApi:
     def resume(self) -> None:
         self.request("PATCH", "/vm", {"state": "Resumed"})
 
+    def snapshot_create(self, *, snapshot_path: Path, mem_path: Path,
+                        snapshot_type: str = "Full") -> None:
+        self.request("PUT", "/snapshot/create", {
+            "snapshot_type": snapshot_type,
+            "snapshot_path": str(snapshot_path),
+            "mem_file_path": str(mem_path),
+        })
+
+    def snapshot_load(self, *, snapshot_path: Path, mem_path: Path,
+                      resume: bool = True, track_dirty_pages: bool = True) -> None:
+        self.request("PUT", "/snapshot/load", {
+            "snapshot_path": str(snapshot_path),
+            "mem_backend": {"backend_path": str(mem_path), "backend_type": "File"},
+            "resume_vm": resume,
+            "track_dirty_pages": track_dirty_pages,
+        })
+
     def info(self) -> dict:
         return self.request("GET", "/") or {}
