@@ -30,9 +30,28 @@ microvm-control list | jq .data.instances
 microvm-control delete demo --yes          # moves to ~/.local/share/microvm/trash
 ```
 
-M0 networking is the shared `fc-tap` (stop another instance before starting
-one; the tap pool arrives in M1). `tests/accept/m0.sh` exercises the whole
-lifecycle rootless, in a private user+network namespace.
+### Networking: tap pool (M1)
+
+One-time, with sudo — creates `mvtap1..N` (`/30` each), static NAT and a
+`microvm-net.service` systemd unit so the pool survives reboots:
+
+```bash
+sudo microvm-control net install --taps 8
+microvm-control net status | jq .data     # taps, allocations, service, NAT
+sudo microvm-control net grow --taps 12   # resize later
+sudo microvm-control net uninstall        # remove unit, taps and pool state
+```
+
+`create` then auto-allocates a free tap/`/30` per instance (pool exhausted →
+`ERR[no-tap-available]`), and `delete` releases it; several microVMs run
+concurrently. Without a pool, `create` falls back to the shared `fc-tap` and
+refuses a second concurrent instance (`net-conflict`). `microvm-control net
+init --taps 8` defines the pool in state without root (useful for tests and
+for inspecting allocation before installing).
+
+`tests/accept/m0.sh` (shared tap) and `tests/accept/m1-pool.sh` (pool, two
+concurrent VMs) exercise the whole lifecycle rootless, in a private
+user+network namespace.
 
 ## Quickstart (shell scripts)
 

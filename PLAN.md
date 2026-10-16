@@ -344,7 +344,7 @@ M2 once the CLI covers them and `README.md` points at the CLI.
 | # | Deliverable | Acceptance (runnable) | Size |
 | --- | --- | --- | --- |
 | ✅ M0 | scaffolding: `fcapi`, `store`, `errors`, JSON envelope; full lifecycle on the existing `images/` + `fc-tap` (`create/start/stop/restart/status/list/exec/cp/logs/delete/caps/doctor/image build`) | `tests/accept/m0.sh` green rootless: create → start → exec → cp → status → logs → stop → delete | S–M |
-| M1 | tap pool + `net install` systemd unit + `create/delete/exec/cp/logs/reap` + locks + `doctor` + userns test lane | 3 instances concurrently, each own tap/IP; create→exec→delete < 10 s; `tests/accept/m1.sh` green rootless | M |
+| M1 | tap pool + `net install` systemd unit + `create/delete/exec/cp/logs/reap` + locks + `doctor` + userns test lane — *net slice done; reap/quotas pending* | 3 instances concurrently, each own tap/IP; create→exec→delete < 10 s; `tests/accept/m1-pool.sh` green rootless | M |
 | M2 | snapshot/clone: reflink cold clone, live clone, identity injection, snapshot guard | `clone demo demo2` < 2 s, demo2 boots with new host keys/IP while demo keeps running; source resumes cleanly | M |
 | M3 | backup/restore: manifest + sha256 + tar.zst, running backup, restore with `--verify boot` | backup of running instance restored on a new id; pre-backup file present; flipped-byte archive refused | M |
 | M4 | LLM entry: references, skill, `caps`, `--dry-run`, agent TTL, audit | pi agent completes a full lifecycle from the skill doc alone; every reply carries `ok/verified/effect` | S–M |
@@ -356,9 +356,12 @@ pace.
 Status: **M0 delivered** (2026-10-16) and passing `tests/accept/m0.sh`;
 JSON contract with `ok/verified/effect/rung`, `ERR[code]`
 refusals, `--dry-run`, per-instance identity (hostname, `/30`-ready interfaces,
-fresh ssh host keys) injected with `debugfs`, and reflinked disks. Next: M1
-(`netpool.py`, tap pool + `net install` systemd unit, `reap`, per-instance ssh
-keys).
+fresh ssh host keys) injected with `debugfs`, and reflinked disks.
+**M1 net slice delivered** (same day): `net init|install|status|grow|uninstall`,
+generated `net-setup.sh` + `microvm-net.service` (tap pool `mvtap1..N`, `/30`
+per tap, static NAT, reboot persistence), pool-aware `create`/`delete`, and
+`tests/accept/m1-pool.sh` running two microVMs concurrently, rootless.
+Next: per-instance ssh keys, `reap`/quotas, M2 snapshots and clone.
 
 ## 13. First actions (next session)
 

@@ -15,9 +15,10 @@ import traceback
 # The pyright language server in this session does not index modules added
 # mid-session; CLI pyright and python3 resolve all of these cleanly.
 from microvm_control import __version__, lifecycle  # pyright: ignore[reportAttributeAccessIssue]
+from microvm_control import netpool  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control.errors import EXIT_INTERRUPT, EXIT_OK, EXIT_REFUSED, DryRun, MvError
 from microvm_control.output import emit, envelope
-from microvm_control.store import home_path  # pyright: ignore[reportMissingImports]
+from microvm_control.store import home_path, sudo_home  # pyright: ignore[reportMissingImports]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,15 +42,29 @@ def build_parser() -> argparse.ArgumentParser:
     image_build_parser.add_argument("--force", action="store_true",
                                     help="rebuild even when the base image is present")
 
+    p_net = sub.add_parser("net", help="tap pool and NAT")
+    net_sub = p_net.add_subparsers(dest="net_verb", required=True)
+    p_net_init = net_sub.add_parser("init", help="define the pool in state (no root)")
+    p_net_init.add_argument("--taps", type=int, default=netpool.DEFAULT_TAPS)
+    net_sub.add_parser("status", help="pool, taps, service and NAT state")
+    p_net_install = net_sub.add_parser("install", help="apply taps + systemd unit (root)")
+    p_net_install.add_argument("--taps", type=int, default=None)
+    p_net_install.add_argument("--user", default=None,
+                               help="tap owner (default: SUDO_USER)")
+    p_net_grow = net_sub.add_parser("grow", help="resize the pool (root)")
+    p_net_grow.add_argument("--taps", type=int, required=True)
+    net_sub.add_parser("uninstall", help="remove the unit, taps and pool state (root)")
+
     p_create = sub.add_parser("create", help="create an instance (disk copies + identity)")
     p_create.add_argument("id")
     p_create.add_argument("--vcpu", type=int, default=2)
     p_create.add_argument("--mem", type=int, default=2048, metavar="MIB", dest="mem_mib")
     p_create.add_argument("--ttl", type=int, metavar="SEC", help="expire after SEC seconds")
-    p_create.add_argument("--tap", default=lifecycle.DEFAULT_TAP)
-    p_create.add_argument("--ip", default=lifecycle.DEFAULT_IP)
-    p_create.add_argument("--gw", default=lifecycle.DEFAULT_GW)
-    p_create.add_argument("--prefix", type=int, default=lifecycle.DEFAULT_PREFIX)
+    p_create.add_argument("--tap", default=None,
+                          help="explicit tap (default: allocate from the pool, else fc-tap)")
+    p_create.add_argument("--ip", default=None, help="explicit guest ip (pair with --tap)")
+    p_create.add_argument("--gw", default=None)
+    p_create.add_argument("--prefix", type=int, default=None)
     p_create.add_argument("--fresh-data", action="store_true",
                           help="start with an empty /persist instead of the base data image")
 
@@ -108,10 +123,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def dispatch(ns) -> dict | tuple[dict, int]:
     home = home_path(ns.home)
+    if ns.verb == "net" and ns.net_verb in ("install", "grow", "uninstall"):
+        home = sudo_home(ns.home)
     if ns.verb == "image":
         if ns.image_verb == "build":
             return lifecycle.image_build(ns, home)
         raise MvError("bad-args", f"unknown image verb: {ns.image_verb}")
+    if ns.verb == "net":
+        return netpool.dispatch(ns, home)
     handlers = {
         "create": lifecycle.create,
         "start": lifecycle.start,

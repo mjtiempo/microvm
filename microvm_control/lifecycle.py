@@ -22,6 +22,7 @@ from typing import IO, Any
 # mid-session; CLI pyright and python3 resolve all of these cleanly.
 from microvm_control import fcapi  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control import identity  # pyright: ignore[reportAttributeAccessIssue]
+from microvm_control import netpool  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control import sshx  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control.errors import DryRun, MvError
 from microvm_control.output import envelope
@@ -376,11 +377,28 @@ def create(ns, home: Path):
     if ttl is None and os.environ.get("MICROVM_AGENT") == "1":
         ttl = AGENT_DEFAULT_TTL_S
     inst = Instance(home, ns.id)
+    explicit = any(value is not None for value in (ns.tap, ns.ip, ns.gw))
+    if explicit and not (ns.tap and ns.ip):
+        raise MvError("bad-args", "--tap and --ip must be given together",
+                      hint="e.g. --tap fc-tap --ip 172.16.0.2 --gw 172.16.0.1")
+    legacy = {"tap": DEFAULT_TAP, "ip": DEFAULT_IP, "gw": DEFAULT_GW,
+              "prefix": DEFAULT_PREFIX, "index": None}
+    if explicit:
+        target = {"tap": ns.tap, "ip": ns.ip, "gw": ns.gw or DEFAULT_GW,
+                  "prefix": ns.prefix or DEFAULT_PREFIX, "index": None}
+    elif ns.dry_run:
+        target = netpool.plan(home, ns.id) or legacy
+    else:
+        target = netpool.allocate(home, ns.id) if netpool.configured(home) else legacy
+    allocated = target.get("index") is not None and not explicit
+
     plan = [
         f"reserve {inst.dir}",
         f"copy {base['dir']}/{base['rootfs']} -> {inst.dir}/disks/rootfs.ext4 (reflink)",
         f"{'fresh' if ns.fresh_data else 'copy'} data -> {inst.dir}/disks/data.ext4",
-        f"inject identity hostname={ns.id} ip={ns.ip}/{ns.prefix} gw={ns.gw} + fresh ssh host keys",
+        f"network {target['tap']} guest {target['ip']}/{target['prefix']} gw {target['gw']}"
+        + (f" (pool index {target['index']})" if target.get("index") else ""),
+        f"inject identity hostname={ns.id} + fresh ssh host keys",
         f"write {inst.meta_path}",
     ]
     if ns.dry_run:
@@ -407,8 +425,8 @@ def create(ns, home: Path):
         copy_file(base["dir"] / (base["key"] + ".pub"), inst.dir / "keys" / "id_ed25519.pub")
 
         ident = identity.inject_identity(
-            rootfs, instance=ns.id, hostname=ns.id, ip=ns.ip, gw=ns.gw,
-            prefix=ns.prefix, workdir=inst.dir / "tmp")
+            rootfs, instance=ns.id, hostname=ns.id, ip=target["ip"], gw=target["gw"],
+            prefix=target["prefix"], workdir=inst.dir / "tmp")
         _rmtree(inst.dir / "tmp")
         _write_text(inst.known_hosts, "\n".join(ident["known_hosts_lines"]) + "\n")
 
@@ -429,8 +447,9 @@ def create(ns, home: Path):
                 "boot_args": DEFAULT_BOOT_ARGS,
                 "track_dirty_pages": True,
             },
-            "net": {"tap": ns.tap, "ip": ns.ip, "gw": ns.gw, "prefix": ns.prefix,
-                    "mac": mac_for(ns.ip)},
+            "net": {"tap": target["tap"], "ip": target["ip"], "gw": target["gw"],
+                    "prefix": target["prefix"], "pool_index": target.get("index"),
+                    "mac": mac_for(target["ip"])},
             "disks": {
                 "rootfs": {"path": "disks/rootfs.ext4", "size_bytes": _size(rootfs)},
                 "data": {"path": "disks/data.ext4", "size_bytes": _size(data)},
@@ -442,7 +461,7 @@ def create(ns, home: Path):
 
         back = inst.load_meta()
         hostname = identity.read_file(rootfs, "/etc/hostname").decode(errors="replace").strip()
-        if back["net"]["ip"] != ns.ip or hostname != ns.id:
+        if back["net"]["ip"] != target["ip"] or hostname != ns.id:
             raise MvError("identity-failed", "identity read-back did not match",
                           detail={"meta_ip": back["net"]["ip"], "guest_hostname": hostname})
         return envelope(instance=inst.summary(back), verified=True, effect="confirmed",
@@ -454,6 +473,8 @@ def create(ns, home: Path):
                                          "host_key_sha256": ident["host_key_sha256"]},
                         })
     except BaseException:
+        if allocated:
+            netpool.release(home, ns.id)
         _rmtree(inst.dir)
         raise
 
@@ -468,6 +489,14 @@ def start(ns, home: Path):
         return envelope(instance=inst.summary(meta), verified=ssh_ready, effect="unverifiable",
                         rung="api", data={"already_running": True, "ssh_ready": ssh_ready})
     base = load_base(home)
+    tap = meta["net"]["tap"]
+    tap_info = netpool.tap_state(tap)
+    if not tap_info["exists"]:
+        raise MvError("tap-missing", f"tap '{tap}' does not exist",
+                      hint="sudo microvm-control net install (pool), or sudo ./net.sh up (shared tap)")
+    if not tap_info["up"]:
+        raise MvError("tap-down", f"tap '{tap}' is not up",
+                      hint=f"sudo ip link set {tap} up")
     _net_conflict(home, meta["net"]["tap"], meta["net"]["ip"], exclude=ns.id)
     plan = [
         f"launch {base['dir']}/firecracker --api-sock {inst.sock} (detached)",
@@ -728,9 +757,23 @@ def delete(ns, home: Path):
         trash_path = str(trash)
     if _exists(inst.dir):
         raise MvError("delete-failed", f"{inst.dir} still exists after delete")
+    if netpool.configured(home):
+        netpool.release(home, ns.id)
     return envelope(verified=True, effect="confirmed", rung="fs",
                     data={"id": ns.id, "purged": bool(ns.purge), "trash_path": trash_path,
                           "freed_bytes": freed})
+
+
+def net_info(home: Path) -> dict:
+    try:
+        pool = netpool.pool_summary(home)
+    except MvError:
+        pool = None
+    if pool is not None:
+        return {"mode": "pool", "pool": pool,
+                "state_path": str(netpool.state_path(home))}
+    return {"mode": "shared-tap", "tap": DEFAULT_TAP, "ip_default": DEFAULT_IP,
+            "note": "run 'microvm-control net init --taps 8' (then 'sudo microvm-control net install') for a pool"}
 
 
 def caps(ns, home: Path):
@@ -763,8 +806,7 @@ def caps(ns, home: Path):
         "host": {"kvm_rw": _kvm_ok(),
                  "debugfs": which("debugfs"), "unshare": which("unshare"),
                  "reflink": _reflink_ok(home)},
-        "net": {"mode": "shared-tap", "tap": DEFAULT_TAP, "ip_default": DEFAULT_IP,
-                "note": "single shared tap in M0; tap pool and static NAT arrive in M1"},
+        "net": net_info(home),
     })
 
 

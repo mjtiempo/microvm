@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import pwd
 import re
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,6 +27,20 @@ def home_path(cli_home: str | None = None) -> Path:
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
     return (base / "microvm").resolve()
+
+
+def sudo_home(cli_home: str | None = None) -> Path:
+    """State dir for root-only verbs run through sudo: the invoking user's."""
+    if cli_home or os.environ.get("MICROVM_HOME"):
+        return home_path(cli_home)
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            pw = pwd.getpwnam(sudo_user)
+        except KeyError:
+            return home_path(cli_home)
+        return (Path(pw.pw_dir) / ".local" / "share" / "microvm").resolve()
+    return home_path(cli_home)
 
 
 def ensure_home(home: Path) -> Path:
