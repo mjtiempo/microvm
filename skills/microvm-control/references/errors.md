@@ -15,6 +15,7 @@ present (failed hashes, API fault message, tap lists, …).
 | `invalid-id` | id/snapshot name must match `[a-z0-9][a-z0-9-]{0,30}` |
 | `bad-args` | flag combination is invalid (e.g. `--tap` without `--ip`); the hint shows the accepted form |
 | `destructive-needs-yes` | `delete` / `net uninstall` without `--yes` while stdin is not a TTY |
+| `quota-exceeded` | the instance limit is reached (default 8, or `max_instances` in `<home>/config.json`). Delete an instance or raise the limit |
 | `locked` | cannot open an instance or net lock file |
 
 ## Filesystem and images

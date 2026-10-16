@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
@@ -27,8 +28,15 @@ from microvm_control import netpool  # pyright: ignore[reportAttributeAccessIssu
 from microvm_control import sshx  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control.errors import DryRun, MvError
 from microvm_control.output import envelope
-from microvm_control.store import Instance, ensure_home, pid_is_firecracker, validate_id  # pyright: ignore[reportMissingImports]
-from microvm_control.util import (
+from microvm_control.store import (  # pyright: ignore[reportMissingImports]
+    Instance,
+    enforce_instance_quota,
+    ensure_home,
+    limits,
+    pid_is_firecracker,
+    validate_id,
+)
+from microvm_control.util import (  # pyright: ignore[reportMissingImports]
     atomic_write_json,
     copy_file,
     du_bytes,
@@ -171,6 +179,19 @@ def load_base(home: Path) -> dict:
     return {"dir": base, **version}
 
 
+def _resolve_runtime(home: Path, meta: dict) -> tuple[Path, Path]:
+    """Firecracker + kernel paths recorded by the instance, or the current base."""
+    config = meta.get("config") or {}
+    image_dir = Path(config.get("image_dir") or base_dir(home))
+    fc_binary = image_dir / "firecracker"
+    kernel = image_dir / str(config.get("kernel") or "")
+    if not (fc_binary.is_file() and kernel.is_file()):
+        raise MvError("image-missing",
+                      f"runtime for '{meta.get('id', '?')}' is incomplete under {image_dir}",
+                      hint="microvm-control image build (or rebuild the instance image set)")
+    return fc_binary, kernel
+
+
 def mac_for(ip: str) -> str:
     octets = ip.split(".")
     if len(octets) != 4:
@@ -250,6 +271,9 @@ def _kill_process(pid, grace: float = 3.0) -> bool:
     if not pid:
         return True
     for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2.0)):
+        # never signal a recycled pid: only a live firecracker process is ours
+        if not pid_is_firecracker(pid):
+            return True
         try:
             os.kill(int(pid), sig)
         except (ProcessLookupError, PermissionError, ValueError):
@@ -260,6 +284,51 @@ def _kill_process(pid, grace: float = 3.0) -> bool:
                 return True
             time.sleep(0.05)
     return not pid_is_firecracker(pid)
+
+
+def _guest_sync(inst: Instance, meta: dict):
+    """Best-effort guest sync before pausing for a consistent copy."""
+    try:
+        res = sshx.run_cmd(inst.key, inst.known_hosts, meta["net"]["ip"], ["sync"], timeout=10)
+        return res["exit_code"] == 0
+    except MvError:
+        return False
+
+
+@contextmanager
+def _source_paused(src: Instance, meta: dict, *, sync: bool = False):
+    """Hold the source lock and pause it (when running) for a disk copy."""
+    with src.lock():
+        running = src.pid_alive(meta)
+        synced = _guest_sync(src, meta) if (running and sync) else None
+        paused = False
+        if running:
+            fcapi.FcApi(src.sock).pause()
+            paused = True
+        try:
+            yield {"running": running, "paused": paused, "synced": synced}
+        except BaseException:
+            if paused:
+                try:
+                    fcapi.FcApi(src.sock).resume()
+                except MvError:
+                    pass
+            raise
+        else:
+            if paused:
+                fcapi.FcApi(src.sock).resume()
+
+
+def _validate_sizes(vcpu, mem_mib) -> None:
+    try:
+        vcpu_int = int(vcpu)
+        mem_int = int(mem_mib)
+    except (TypeError, ValueError) as exc:
+        raise MvError("bad-args", "vcpu and mem must be integers") from exc
+    if not 1 <= vcpu_int <= 64:
+        raise MvError("bad-args", "--vcpu must be between 1 and 64")
+    if not 128 <= mem_int <= 262144:
+        raise MvError("bad-args", "--mem must be between 128 and 262144 MiB")
 
 
 def _net_conflict(home: Path, tap: str, ip: str, exclude: str) -> None:
@@ -453,8 +522,12 @@ def image_build(ns, home: Path):
         try:
             version = json.loads(version_path.read_text())
         except (OSError, ValueError):
-            pass
-        return envelope(data={"base_dir": str(base), "up_to_date": True, **version})
+            version = {}
+        try:
+            load_base(home)
+            return envelope(data={"base_dir": str(base), "up_to_date": True, **version})
+        except MvError:
+            pass  # the image set is incomplete: fall through and rebuild it
     if ns.dry_run:
         raise DryRun([f"build base image into {base}"])
 
@@ -519,6 +592,8 @@ def image_build(ns, home: Path):
 def create(ns, home: Path):
     validate_id(ns.id)
     ensure_home(home)
+    enforce_instance_quota(home)
+    _validate_sizes(ns.vcpu, ns.mem_mib)
     base = load_base(home)
     ttl = ns.ttl
     if ttl is None and os.environ.get("MICROVM_AGENT") == "1":
@@ -587,7 +662,7 @@ def start(ns, home: Path):
         ssh_ready = sshx.probe(inst.key, inst.known_hosts, meta["net"]["ip"]) if wait_ssh else None
         return envelope(instance=inst.summary(meta), verified=ssh_ready, effect="unverifiable",
                         rung="api", data={"already_running": True, "ssh_ready": ssh_ready})
-    base = load_base(home)
+    fc_binary, kernel = _resolve_runtime(home, meta)
     tap = meta["net"]["tap"]
     tap_info = netpool.tap_state(tap)
     if not tap_info["exists"]:
@@ -598,7 +673,7 @@ def start(ns, home: Path):
                       hint=f"sudo ip link set {tap} up")
     _net_conflict(home, meta["net"]["tap"], meta["net"]["ip"], exclude=ns.id)
     plan = [
-        f"launch {base['dir']}/firecracker --api-sock {inst.sock} (detached)",
+        f"launch {fc_binary} --api-sock {inst.sock} (detached)",
         f"configure vcpu={meta['config']['vcpu']} mem={meta['config']['mem_mib']}MiB "
         f"tap={meta['net']['tap']} mac={meta['net']['mac']}",
         "InstanceStart",
@@ -620,7 +695,7 @@ def start(ns, home: Path):
             raise
         try:
             proc = subprocess.Popen(
-                [str(base["dir"] / "firecracker"), "--api-sock", str(inst.sock)],
+                [str(fc_binary), "--api-sock", str(inst.sock)],
                 cwd=str(inst.dir), stdin=subprocess.DEVNULL,
                 stdout=console, stderr=fc_log,
                 start_new_session=True, close_fds=True,
@@ -645,7 +720,7 @@ def start(ns, home: Path):
             ]
             iface = {"iface_id": "eth0", "host_dev_name": meta["net"]["tap"],
                      "guest_mac": meta["net"]["mac"]}
-            api.configure(kernel=base["dir"] / meta["config"]["kernel"],
+            api.configure(kernel=kernel,
                           boot_args=meta["config"]["boot_args"],
                           vcpu=meta["config"]["vcpu"], mem_mib=meta["config"]["mem_mib"],
                           track_dirty_pages=True, drives=drives, iface=iface,
@@ -668,7 +743,9 @@ def start(ns, home: Path):
         meta["state"] = "running"
         meta["pid"] = proc.pid
         inst.save_meta(meta)
-        return envelope(instance=inst.summary(meta), verified=True, effect="confirmed",
+        return envelope(instance=inst.summary(meta),
+                        verified=True if wait_ssh else False,
+                        effect="confirmed" if wait_ssh else "unverifiable",
                         rung="api+ssh" if wait_ssh else "api", data={
                             "pid": proc.pid,
                             "boot_ms": round(boot_ms, 1),
@@ -906,7 +983,8 @@ def caps(ns, home: Path):
         "home": str(home),
         "base": base_info,
         "instances": {"total": len(instances), "running": running},
-        "limits": {"max_instances": 8, "agent_default_ttl_s": AGENT_DEFAULT_TTL_S},
+        "limits": {"max_instances": limits(home)["max_instances"],
+                   "agent_default_ttl_s": AGENT_DEFAULT_TTL_S},
         "disk": {"free_bytes": free, "free_human": _human(free)},
         "host": {"kvm_rw": _kvm_ok(),
                  "debugfs": which("debugfs"), "unshare": which("unshare"),
@@ -940,6 +1018,15 @@ def doctor(ns, home: Path):
         check("home-writable", True, str(home))
     except OSError as exc:
         check("home-writable", False, str(exc))
+    net_state = netpool.state_path(home)
+    if _exists(net_state):
+        try:
+            readable = os.access(net_state, os.R_OK)
+        except OSError:
+            readable = False
+        check("net-state", readable,
+              f"{net_state} is {'readable' if readable else 'NOT readable'} "
+              f"(fix: sudo chown \"$(id -u):$(id -g)\" {net_state})")
     tap = subprocess.run(["ip", "link", "show", DEFAULT_TAP], capture_output=True, text=True)
     tap_up = tap.returncode == 0 and "UP" in tap.stdout.split("\n")[0]
     check("tap", tap_up,
@@ -980,6 +1067,8 @@ def clone(ns, home: Path):
         config["vcpu"] = ns.vcpu
     if ns.mem_mib:
         config["mem_mib"] = ns.mem_mib
+    _validate_sizes(config.get("vcpu"), config.get("mem_mib"))
+    enforce_instance_quota(home)
     running = src.pid_alive(smeta)
     dst = Instance(home, ns.id)
     plan = [
@@ -991,33 +1080,22 @@ def clone(ns, home: Path):
     ]
     if ns.dry_run:
         raise DryRun(plan)
-    paused = False
-    error = None
     result = None
     try:
-        if running:
-            fcapi.FcApi(src.sock).pause()
-            paused = True
-        result = _materialize_instance(
-            home, ns.id,
-            rootfs_src=src.dir / "disks" / "rootfs.ext4",
-            data_src=src.dir / "disks" / "data.ext4",
-            fresh_data=ns.fresh_data, target=target, config=config, ttl=ns.ttl,
-            source={"id": src.id, "from": "running" if running else "stopped",
-                    "at": now_iso()})
-    except BaseException as exc:
-        error = exc
-    if paused:
-        try:
-            fcapi.FcApi(src.sock).resume()
-        except MvError as exc:
-            if error is None:
-                error = MvError("resume-failed", f"could not resume '{src.id}' after cloning",
-                                hint=f"microvm-control restart {src.id}", detail=str(exc))
-    if error is not None:
+        with _source_paused(src, smeta):
+            result = _materialize_instance(
+                home, ns.id,
+                rootfs_src=src.dir / "disks" / "rootfs.ext4",
+                data_src=src.dir / "disks" / "data.ext4",
+                fresh_data=ns.fresh_data, target=target, config=config, ttl=ns.ttl,
+                source={"id": src.id, "from": "running" if running else "stopped",
+                        "at": now_iso()})
+    except BaseException:
         if allocated:
             netpool.release(home, ns.id)
-        raise error
+        raise
+    if result is None:
+        raise MvError("internal", "clone produced no result")
     if result is None:
         raise MvError("internal", "clone produced no result")
     inst, meta, ident, mode = result
@@ -1053,7 +1131,7 @@ def snapshot_create(ns, home: Path):
     if _exists(snap_dir):
         raise MvError("already-exists", f"snapshot '{ns.name}' already exists for '{ns.id}'",
                       hint=f"microvm-control snapshot delete {ns.id} --name {ns.name}")
-    binary = Path(meta["config"]["image_dir"]) / "firecracker"
+    binary, _kernel = _resolve_runtime(home, meta)
     version = firecracker_version(binary)
     vmstate = snap_dir / "vmstate.bin"
     mem = snap_dir / "mem.bin"
@@ -1133,7 +1211,7 @@ def snapshot_load(ns, home: Path):
     inst = Instance(home, ns.id)
     meta = inst.reconcile()
     snap_dir, snap = _load_snapshot_meta(inst, ns.name)
-    binary = Path(meta["config"]["image_dir"]) / "firecracker"
+    binary, _kernel = _resolve_runtime(home, meta)
     live_version = firecracker_version(binary)
     if snap.get("firecracker") not in (None, "unknown", live_version):
         raise MvError("snapshot-version-mismatch",
@@ -1152,6 +1230,7 @@ def snapshot_load(ns, home: Path):
         raise MvError("disk-modified", "a disk image changed size since this snapshot",
                       hint="use --force to load anyway (the disks will not be reverted)",
                       detail={"disks": mismatched})
+    _net_conflict(home, meta["net"]["tap"], meta["net"]["ip"], exclude=ns.id)
     plan = [f"stop {ns.id}" if inst.pid_alive(meta) else f"{ns.id} already stopped",
             f"load snapshot '{ns.name}' ({snap.get('firecracker')})", "wait for ssh"]
     if ns.dry_run:
@@ -1256,7 +1335,11 @@ def gc(ns, home: Path):
     trash_days = ns.trash_days if ns.trash_days is not None else 7
     artifact_days = ns.artifact_days if ns.artifact_days is not None else 7
     now = now_epoch()
-    plan = []
+    targets: list[dict] = []
+
+    def add(kind: str, path: Path) -> None:
+        targets.append({"kind": kind, "path": str(path)})
+
     trash_root = home / "trash"
     if _exists(trash_root):
         for child in sorted(trash_root.iterdir()):
@@ -1265,7 +1348,7 @@ def gc(ns, home: Path):
             except OSError:
                 continue
             if age >= trash_days * 86400:
-                plan.append(f"remove {child}")
+                add("trash", child)
     for inst in Instance.all(home):
         artifacts = inst.dir / "artifacts"
         if not _exists(artifacts):
@@ -1276,7 +1359,7 @@ def gc(ns, home: Path):
             except OSError:
                 continue
             if entry.is_file() and age >= artifact_days * 86400:
-                plan.append(f"remove {entry}")
+                add("artifact", entry)
     if ns.snapshot_days is not None:
         for inst in Instance.all(home):
             if not _exists(inst.snapshots_dir):
@@ -1287,13 +1370,13 @@ def gc(ns, home: Path):
                 except OSError:
                     continue
                 if snap.is_dir() and age >= ns.snapshot_days * 86400:
-                    plan.append(f"remove {snap}")
+                    add("snapshot", snap)
     if ns.dry_run:
-        raise DryRun(plan or ["nothing to collect"])
+        raise DryRun([f"remove {t['path']}" for t in targets] or ["nothing to collect"])
     freed = 0
     removed = 0
-    for item in plan:
-        path = Path(item.split(" ", 1)[1])
+    for target in targets:
+        path = Path(target["path"])
         freed += du_bytes(path)
         if path.is_dir():
             _rmtree(path)
@@ -1302,7 +1385,8 @@ def gc(ns, home: Path):
         removed += 1
     return envelope(verified=True, effect="confirmed", rung="fs",
                     data={"removed": removed, "freed_bytes": freed,
-                          "items": plan})
+                          "freed_bytes_note": "apparent size; reflinked extents may free less",
+                          "items": targets})
 
 
 # --------------------------------------------------------------------------- #
@@ -1338,12 +1422,20 @@ def browser(ns, home: Path):
                           detail=res["stderr"][-400:])
         encoded = text.encode()
         truncated = len(encoded) > INLINE_LIMIT
+        out_path = None
+        if truncated:
+            out = Path(ns.out).expanduser() if ns.out else (
+                Path.cwd() / f"{inst.id}-browser-{int(now_epoch())}.html")
+            _write_text(out, text)
+            out_path = str(out)
         return envelope(instance=inst.summary(meta), verified=True, effect="confirmed",
                         rung="guest-chromium",
                         data={"action": "dom", "url": url,
-                              "dom": text if not truncated else None,
+                              "dom": None if truncated else text,
                               "dom_bytes": len(encoded),
-                              "dom_truncated": truncated})
+                              "dom_truncated": truncated,
+                              "out_path": out_path,
+                              "out_sha256": sha256_file(Path(out_path)) if out_path else None})
 
     ext = "png" if action == "screenshot" else "pdf"
     magic = b"\x89PNG\r\n\x1a\n" if ext == "png" else b"%PDF"
@@ -1362,8 +1454,6 @@ def browser(ns, home: Path):
     except MvError as exc:
         raise MvError("browser-failed", f"chromium did not produce {guest_path}",
                       detail={"chromium": res["stderr"][-300:], "scp": str(exc)}) from exc
-    except Exception:
-        raise
     size = _size(out)
     try:
         head = out.read_bytes()[:8]

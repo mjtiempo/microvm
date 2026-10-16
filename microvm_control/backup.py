@@ -12,19 +12,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import shutil
 import tempfile
 from pathlib import Path
 
-from microvm_control import sshx
 from microvm_control.errors import DryRun, MvError
+from microvm_control.lifecycle import (  # shared internals
+    _materialize_instance,
+    _source_paused,
+    _validate_sizes,
+)
 from microvm_control.output import envelope
-from microvm_control.store import Instance, ensure_home, validate_id
+from microvm_control.store import (
+    Instance,
+    enforce_instance_quota,
+    ensure_home,
+    validate_id,
+)
 from microvm_control.util import (
     atomic_write_json,
     copy_file,
     du_bytes,
-    free_bytes,
+    ensure_space,
     now_epoch,
     now_iso,
     run,
@@ -108,6 +118,25 @@ def _untar_zstd(archive: Path, staging: Path) -> None:
                       detail=(cp.stderr or cp.stdout).strip()[-500:])
 
 
+def _assert_safe_members(archive: Path) -> None:
+    """Refuse archives with absolute or parent-escaping member paths."""
+    cp = run(["tar", "--zstd", "-tf", str(archive)])
+    if cp.returncode != 0:
+        raise MvError("backup-corrupt", "the archive could not be listed",
+                      detail=(cp.stderr or cp.stdout).strip()[-300:])
+    bad = []
+    for line in (cp.stdout or "").splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        normalized = posixpath.normpath(name)
+        if normalized.startswith("/") or normalized == ".." or normalized.startswith("../"):
+            bad.append(name)
+    if bad:
+        raise MvError("backup-corrupt", "archive contains unsafe member paths",
+                      detail={"members": bad[:10]})
+
+
 def _tar_read_member(archive: Path, name: str) -> bytes:
     cp = run(["tar", "--zstd", "-xOf", str(archive), "./" + name])
     if cp.returncode != 0:
@@ -157,6 +186,15 @@ def _convert_from_qcow(staging: Path) -> None:
 # verbs
 # --------------------------------------------------------------------------- #
 
+def _copy_disks(inst: Instance, staging: Path, no_data: bool) -> list[str]:
+    names = ["rootfs.ext4"]
+    copy_file(inst.dir / "disks" / "rootfs.ext4", staging / "rootfs.ext4")
+    if not no_data:
+        copy_file(inst.dir / "disks" / "data.ext4", staging / "data.ext4")
+        names.append("data.ext4")
+    return names
+
+
 def backup(ns, home: Path):
     inst = Instance(home, ns.id)
     meta = inst.reconcile()
@@ -182,41 +220,24 @@ def backup(ns, home: Path):
     if ns.dry_run:
         raise DryRun(plan)
     needed = du_bytes(inst.dir) + FREESPACE_HEADROOM
-    if free_bytes(home) < needed:
-        raise MvError("disk-full", "not enough free space for the staging copy",
-                      hint="free space under the state dir or use --format qcow2",
-                      detail={"needed_bytes": needed})
+    ensure_space(home, needed, label="the backup staging copy")
+    ensure_space(out_dir, needed if fmt == "raw-dir" else needed // 2,
+                 label=f"the {fmt} archive")
 
     staging = _staging_dir(home)
-    paused = False
     synced = None
-    error = None
-    archive_path = None
+    disk_names = ["rootfs.ext4"]
     try:
         if pause:
-            synced = _guest_sync(inst, meta)
-            from microvm_control import fcapi
-            fcapi.FcApi(inst.sock).pause()
-            paused = True
-        copy_file(inst.dir / "disks" / "rootfs.ext4", staging / "rootfs.ext4")
-        disk_names = ["rootfs.ext4"]
-        if not ns.no_data:
-            copy_file(inst.dir / "disks" / "data.ext4", staging / "data.ext4")
-            disk_names.append("data.ext4")
+            with _source_paused(inst, meta, sync=True) as state:
+                synced = state["synced"]
+                disk_names = _copy_disks(inst, staging, ns.no_data)
+        else:
+            disk_names = _copy_disks(inst, staging, ns.no_data)
         _write_json(staging / "meta.json", _patch_meta(meta))
-    except BaseException as exc:
-        error = exc
-    if paused:
-        try:
-            from microvm_control import fcapi
-            fcapi.FcApi(inst.sock).resume()
-        except MvError as exc:
-            if error is None:
-                error = MvError("resume-failed", f"could not resume '{inst.id}' after backing up",
-                                hint=f"microvm-control restart {inst.id}", detail=str(exc))
-    if error is not None:
+    except BaseException:
         _rmtree(staging)
-        raise error
+        raise
 
     disk_format = "raw"
     if fmt == "qcow2":
@@ -289,14 +310,6 @@ def backup(ns, home: Path):
                           "guest_synced": synced})
 
 
-def _guest_sync(inst: Instance, meta: dict):
-    try:
-        res = sshx.run_cmd(inst.key, inst.known_hosts, meta["net"]["ip"], ["sync"], timeout=10)
-        return res["exit_code"] == 0
-    except MvError:
-        return False
-
-
 def _exists(path: Path) -> bool:
     try:
         return path.exists()
@@ -309,8 +322,12 @@ def restore(ns, home: Path):
     if not _exists(archive):
         raise MvError("not-found", f"archive {archive} does not exist")
     ensure_home(home)
+    enforce_instance_quota(home)
     staging = _staging_dir(home)
     try:
+        source_bytes = du_bytes(archive)
+        ensure_space(staging, source_bytes * 4 + FREESPACE_HEADROOM,
+                     label="the restore workspace")
         if archive.is_dir():
             for child in archive.iterdir():
                 dest = staging / child.name
@@ -319,6 +336,7 @@ def restore(ns, home: Path):
                 else:
                     copy_file(child, dest)
         else:
+            _assert_safe_members(archive)
             _untar_zstd(archive, staging)
         manifest_path = staging / MANIFEST
         if not manifest_path.is_file():
@@ -376,14 +394,16 @@ def restore(ns, home: Path):
         if not target.get("tap") or not target.get("ip"):
             raise MvError("bad-args", "no usable network config (archive has none; pass --tap/--ip)")
         has_data = (staging / "data.ext4").is_file()
+        config = manifest.get("config") or {}
+        _validate_sizes(config.get("vcpu"), config.get("mem_mib"))
         allocated = target.get("index") is not None and not explicit
         try:
-            inst, meta, ident, mode = lifecycle._materialize_instance(
+            inst, meta, ident, mode = _materialize_instance(
                 home, new_id,
                 rootfs_src=staging / "rootfs.ext4",
                 data_src=staging / "data.ext4",
                 fresh_data=ns.fresh_data or not has_data,
-                target=target, config=manifest.get("config") or {}, ttl=ns.ttl,
+                target=target, config=config, ttl=ns.ttl,
                 source={"restored_from": str(archive), "original": original,
                         "at": now_iso()})
         except BaseException:

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
-EXIT_USAGE = 2
 EXIT_INTERRUPT = 130
 
 

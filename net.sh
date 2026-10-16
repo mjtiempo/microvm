@@ -21,8 +21,8 @@ up() {
   ip link set "$TAP" up
 
   sysctl -qw net.ipv4.ip_forward=1
-  iptables -t nat -C POSTROUTING -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
+  iptables -t nat -C POSTROUTING -s 172.16.0.0/12 -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s 172.16.0.0/12 -o "$HOST_IFACE" -j MASQUERADE
   iptables -C FORWARD -i "$TAP" -o "$HOST_IFACE" -j ACCEPT 2>/dev/null || \
     iptables -I FORWARD -i "$TAP" -o "$HOST_IFACE" -j ACCEPT
   iptables -C FORWARD -i "$HOST_IFACE" -o "$TAP" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
@@ -36,7 +36,7 @@ down() {
   [ -n "$HOST_IFACE" ] && {
     iptables -D FORWARD -i "$HOST_IFACE" -o "$TAP" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "$TAP" -o "$HOST_IFACE" -j ACCEPT 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -s 172.16.0.0/12 -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || true
   }
   ip link del "$TAP" 2>/dev/null || true
   echo "tap $TAP removed, NAT rules dropped"

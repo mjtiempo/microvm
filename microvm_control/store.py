@@ -14,8 +14,8 @@ from .errors import MvError
 from .util import atomic_write_json, now_epoch
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
-META_SCHEMA = 1
 LIVE_STATES = ("starting", "running", "paused")
+DEFAULT_MAX_INSTANCES = 8
 
 
 def home_path(cli_home: str | None = None) -> Path:
@@ -45,8 +45,51 @@ def sudo_home(cli_home: str | None = None) -> Path:
 
 def ensure_home(home: Path) -> Path:
     for sub in ("instances", "images", "trash", "locks", "logs"):
-        (home / sub).mkdir(parents=True, exist_ok=True)
+        _mkdir(home / sub)
+    # the home holds audit/meta/net state; keep it private to the owner
+    _chmod(home, 0o700)
+    _chmod(home / "instances", 0o700)
     return home
+
+
+def _mkdir(path: Path, mode: int = 0o700) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=mode)
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot create {path}", detail=str(exc)) from exc
+
+
+def _chmod(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        return
+
+
+def limits(home: Path) -> dict:
+    """Host limits; override with $MICROVM_HOME/config.json."""
+    data: dict = {}
+    path = home / "config.json"
+    try:
+        if path.is_file():
+            parsed = json.loads(path.read_text())
+            if isinstance(parsed, dict):
+                data = parsed
+    except (OSError, ValueError):
+        data = {}
+    try:
+        max_instances = int(data.get("max_instances", DEFAULT_MAX_INSTANCES))
+    except (TypeError, ValueError):
+        max_instances = DEFAULT_MAX_INSTANCES
+    return {"max_instances": max(1, max_instances)}
+
+
+def enforce_instance_quota(home: Path) -> None:
+    limit = limits(home)["max_instances"]
+    existing = len(Instance.all(home))
+    if existing >= limit:
+        raise MvError("quota-exceeded", f"instance limit reached ({existing}/{limit})",
+                      hint="delete an instance or raise max_instances in config.json")
 
 
 def validate_id(instance_id: str) -> None:
@@ -82,7 +125,10 @@ class Instance:
         self.snapshots_dir = self.dir / "snapshots"
 
     def exists(self) -> bool:
-        return self.meta_path.is_file()
+        try:
+            return self.meta_path.is_file()
+        except OSError:
+            return False
 
     def load_meta(self) -> dict:
         if not self.meta_path.is_file():
@@ -95,7 +141,11 @@ class Instance:
                           detail=str(exc)) from exc
 
     def save_meta(self, meta: dict) -> None:
-        atomic_write_json(self.meta_path, meta)
+        try:
+            atomic_write_json(self.meta_path, meta)
+        except OSError as exc:
+            raise MvError("io-failed", f"cannot write {self.meta_path}",
+                          detail=str(exc)) from exc
 
     @contextmanager
     def lock(self):

@@ -35,7 +35,7 @@ A mutation is never `ok: true` on a bare acknowledgement:
 | verb | verified by |
 | --- | --- |
 | `create` / `clone` / `restore` | reading the new identity back from the disk image |
-| `start` / `snapshot load` | an SSH probe into the guest (`ssh_ready_ms`) |
+| `start` / `snapshot load` | an SSH probe into the guest (`ssh_ready_ms`); with `--no-wait-ssh`, `start` says `verified: false` / `effect: "unverifiable"` |
 | `stop` | the Firecracker process being gone; `unconfirmed` if signals were needed |
 | `snapshot create` | snapshot files exist and are non-empty |
 | `backup` | the manifest is read back out of the archive |

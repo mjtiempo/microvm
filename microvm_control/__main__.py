@@ -23,7 +23,7 @@ from microvm_control import netpool  # pyright: ignore[reportAttributeAccessIssu
 from microvm_control.errors import EXIT_INTERRUPT, EXIT_OK, EXIT_REFUSED, DryRun, MvError
 from microvm_control.output import emit, envelope
 from microvm_control.store import home_path, sudo_home  # pyright: ignore[reportMissingImports]
-from microvm_control.util import now_iso  # pyright: ignore[reportMissingImports]
+from microvm_control.util import adopt_ownership, invoking_identity, now_iso  # pyright: ignore[reportMissingImports]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -253,6 +253,7 @@ def dispatch(ns, home: Path) -> dict | tuple[dict, int]:
 def main(argv: list[str] | None = None) -> int:
     ns = build_parser().parse_args(argv)
     home = resolve_home(ns)
+    privileged = ns.verb == "net" and ns.net_verb in ("install", "grow", "uninstall")
     started = time.monotonic()
     ok = False
     code = None
@@ -302,6 +303,11 @@ def main(argv: list[str] | None = None) -> int:
             "code": code,
             "duration_ms": round((time.monotonic() - started) * 1000, 1),
         })
+        if privileged and os.geteuid() == 0:
+            # sudo wrote state as root; hand it back to the invoking user so
+            # every later unprivileged verb can read it (see C1 in the review)
+            adopt_ownership([home, home / netpool.STATE_NAME, home / audit.AUDIT_NAME],
+                            invoking_identity())
     return exit_code
 
 

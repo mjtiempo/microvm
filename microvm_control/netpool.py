@@ -111,7 +111,11 @@ def load_state(home: Path) -> dict | None:
 
 
 def save_state(home: Path, state: dict) -> None:
-    atomic_write_json(state_path(home), state)
+    try:
+        atomic_write_json(state_path(home), state)
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot write {state_path(home)}",
+                      detail=str(exc)) from exc
 
 
 @contextmanager
@@ -263,7 +267,7 @@ SCRIPT_TEMPLATE = """#!/bin/sh
 set -eu
 
 TAPS=%(taps)d
-TAP_USER=%(user)s
+TAP_USER='%(user)s'
 BASE="%(base)s"
 
 WAN="$(ip route list default 2>/dev/null | awk '/^default/{print $5; exit}')"
@@ -360,6 +364,16 @@ def _validate_taps(taps: int) -> int:
     return taps
 
 
+TAP_USER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def validate_tap_user(user: str) -> str:
+    if not TAP_USER_RE.match(user or ""):
+        raise MvError("bad-args", f"invalid tap owner name: {user!r}",
+                      hint="usernames must match [A-Za-z0-9._-]+")
+    return user
+
+
 def _new_state(home: Path, taps: int, user: str | None) -> dict:
     state = _reconcile(load_state(home) or {}, home)
     return {
@@ -426,6 +440,7 @@ def net_install(ns, home: Path):
         pwd.getpwnam(user)
     except KeyError as exc:
         raise MvError("bad-args", f"user {user!r} does not exist") from exc
+    validate_tap_user(user)
 
     _write_file(SCRIPT_PATH, _render_script(taps, user), 0o755)
     _write_file(UNIT_PATH, _render_unit(), 0o644)

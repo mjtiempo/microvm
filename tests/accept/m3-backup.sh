@@ -5,6 +5,7 @@
 # Usage: tests/accept/m3-backup.sh
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/../.."
+. "$PWD/tests/accept/lib.sh"
 
 MC="$PWD/microvm-control"
 WORK=$(mktemp -d "$HOME/.cache/microvm-accept-m3.XXXXXX")
@@ -12,7 +13,7 @@ export MICROVM_HOME="$WORK/home" MC WORK
 mkdir -p "$MICROVM_HOME"
 
 cleanup() {
-  pkill -x firecracker 2>/dev/null || true
+  kill_own_vms "$MICROVM_HOME" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT

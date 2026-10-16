@@ -42,7 +42,10 @@ if [ ! -x images/firecracker ]; then
   echo "==> downloading firecracker"
   tag="${FC_VERSION:-$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$GITHUB/releases/latest")")}"
   case "$tag" in v*) ;; *) tag="v$tag" ;; esac
-  curl -fL --retry 3 "$GITHUB/releases/download/$tag/firecracker-$tag-$ARCH.tgz" -o build/fc.tgz
+  bash scripts/fetch-verified.sh \
+    "$GITHUB/releases/download/$tag/firecracker-$tag-$ARCH.tgz" \
+    "$GITHUB/releases/download/$tag/firecracker-$tag-$ARCH.tgz.sha256.txt" \
+    build/fc.tgz
   tar -xzf build/fc.tgz -C build --no-same-owner
   mv "build/release-$tag-$ARCH/firecracker-$tag-$ARCH" images/firecracker
   [ -f "build/release-$tag-$ARCH/jailer-$tag-$ARCH" ] && \
@@ -61,7 +64,10 @@ if [ ! -e images/vmlinux ]; then
   key=$(curl -fsSL --retry 3 "$S3?list-type=2&prefix=$prefix$ARCH/vmlinux-" \
     | grep -o '<Key>[^<]*' | sed 's/<Key>//' | grep -vE '\.config$|-no-acpi$' | sort -V | tail -1)
   ver=${key##*/vmlinux-}
+  # the CI bucket publishes no checksum for kernels; record the digest for
+  # subsequent verification instead (see the review note in PLAN.md)
   curl -fL --retry 3 "$S3/$key" -o "images/vmlinux-$ver"
+  sha256sum "images/vmlinux-$ver" | awk '{print $1}' > "images/vmlinux-$ver.sha256"
   ln -sfn "vmlinux-$ver" images/vmlinux
 fi
 
@@ -72,14 +78,18 @@ if [ -z "$ALPINE_VERSION" ]; then
 fi
 [ -n "$ALPINE_BRANCH" ] || ALPINE_BRANCH="v${ALPINE_VERSION%.*}"
 minirootfs="alpine-minirootfs-$ALPINE_VERSION-$ARCH.tar.gz"
-[ -f "build/$minirootfs" ] || \
-  curl -fL --retry 3 "$ALPINE_CDN/latest-stable/releases/$ARCH/$minirootfs" -o "build/$minirootfs"
+bash scripts/fetch-verified.sh \
+  "$ALPINE_CDN/latest-stable/releases/$ARCH/$minirootfs" \
+  "$ALPINE_CDN/latest-stable/releases/$ARCH/$minirootfs.sha256" \
+  "build/$minirootfs"
 
 apk_ver=$(curl -fsSL --retry 3 "$ALPINE_CDN/$ALPINE_BRANCH/main/$ARCH/APKINDEX.tar.gz" \
   | tar -xzO APKINDEX | awk '/^P:apk-tools-static$/{p=1} p&&/^V:/{print substr($0,3);p=0}')
 [ -n "$apk_ver" ] || { echo "error: could not resolve apk-tools-static version" >&2; exit 1; }
 if [ ! -x build/sbin/apk.static ] || [ "$(cat build/apk.static.version 2>/dev/null || true)" != "$apk_ver" ]; then
   echo "==> downloading apk-tools-static $apk_ver"
+  # packages installed by apk.static are signature-verified against the
+  # Alpine keys in the rootfs; this bootstrap binary is not covered by them
   rm -rf build/sbin
   mkdir -p build/sbin
   curl -fL --retry 3 "$ALPINE_CDN/$ALPINE_BRANCH/main/$ARCH/apk-tools-static-$apk_ver.apk" -o build/apk.apk

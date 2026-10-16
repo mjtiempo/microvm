@@ -5,6 +5,7 @@
 # contract.  Usage: tests/accept/m0.sh
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/../.."
+. "$PWD/tests/accept/lib.sh"
 
 MC="$PWD/microvm-control"
 WORK=$(mktemp -d "$HOME/.cache/microvm-accept.XXXXXX")
@@ -13,7 +14,7 @@ export MC WORK
 mkdir -p "$MICROVM_HOME"
 
 cleanup() {
-  pkill -x firecracker 2>/dev/null || true
+  kill_own_vms "$MICROVM_HOME" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -24,6 +25,7 @@ printf '\n== image build (import from repo images)\n'
 inner="$WORK/inner.sh"
 cat > "$inner" <<'EOS'
 set -euo pipefail
+. "$PWD/tests/accept/lib.sh"
 ip link set lo up
 ip tuntap add dev fc-m0 mode tap
 ip addr add 172.16.0.1/24 dev fc-m0
@@ -39,6 +41,17 @@ say "create"
 
 say "start (waits for ssh readiness)"
 "$MC" start demo | jq -e '.ok and .verified == true and .data.ssh_ready_ms > 0' >/dev/null || fail "start"
+
+say "start --no-wait-ssh is honest and still becomes reachable"
+"$MC" stop demo | jq -e '.ok' >/dev/null || fail "stop before no-wait start"
+"$MC" start demo --no-wait-ssh \
+  | jq -e '.ok and (.verified == false) and .effect == "unverifiable" and .rung == "api"' >/dev/null \
+  || fail "no-wait-ssh contract"
+for _ in $(seq 1 40); do
+  if "$MC" status demo --probe 2>/dev/null | jq -e '.data.ssh_reachable == true' >/dev/null 2>&1; then break; fi
+  sleep 0.5
+done
+"$MC" exec demo -- true | jq -e '.data.exit_code == 0' >/dev/null || fail "not reachable after no-wait start"
 
 say "exec"
 "$MC" exec demo -- uname -s | jq -e '.data.exit_code == 0 and (.data.stdout | test("Linux"))' >/dev/null || fail "exec"
@@ -62,7 +75,7 @@ say "logs (serial console captured)"
 
 say "stop (graceful)"
 "$MC" stop demo | jq -e '.ok and .instance.state == "stopped"' >/dev/null || fail "stop"
-if pgrep -x firecracker >/dev/null; then fail "firecracker still running after stop"; fi
+if ! assert_no_own_vms "$MICROVM_HOME"; then fail "firecracker still running after stop"; fi
 
 say "delete (moved to trash)"
 "$MC" delete demo --yes | jq -e '.ok and .data.trash_path != null' >/dev/null || fail "delete"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import subprocess
 import tempfile
 import time
@@ -96,8 +97,55 @@ def du_bytes(path: Path) -> int:
 
 
 def free_bytes(path: Path) -> int:
-    st = os.statvfs(str(path))
+    try:
+        st = os.statvfs(str(path))
+    except OSError as exc:
+        raise MvError("io-failed", f"cannot stat the filesystem for {path}",
+                      detail=str(exc)) from exc
     return st.f_bavail * st.f_frsize
+
+
+def invoking_identity() -> tuple[int, int] | None:
+    """uid/gid of the user who ran sudo, when running as root on their behalf."""
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if sudo_uid and sudo_gid:
+        try:
+            return int(sudo_uid), int(sudo_gid)
+        except ValueError:
+            return None
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            pw = pwd.getpwnam(sudo_user)
+        except KeyError:
+            return None
+        return pw.pw_uid, pw.pw_gid
+    return None
+
+
+def adopt_ownership(paths: list[Path], owner: tuple[int, int] | None) -> None:
+    """Best-effort chown of state written by a privileged verb."""
+    if owner is None:
+        return
+    uid, gid = owner
+    for path in paths:
+        try:
+            if path.exists():
+                os.chown(path, uid, gid)
+        except OSError:
+            continue
+
+
+def ensure_space(target: Path, need: int, *, label: str) -> None:
+    """Refuse when the filesystem behind `target` cannot hold `need` bytes."""
+    probe = target
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    free = free_bytes(probe)
+    if free < need:
+        raise MvError("disk-full", f"not enough free space on {probe} for {label}",
+                      detail={"free_bytes": free, "needed_bytes": need})
 
 
 def copy_file(src: Path, dst: Path) -> str:

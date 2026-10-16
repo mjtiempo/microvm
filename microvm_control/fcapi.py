@@ -49,11 +49,11 @@ class FcApi:
             conn.close()
 
         if resp.status >= 400:
-            fault = ""
             try:
-                fault = json.loads(raw.decode()).get("fault_message", "")
+                parsed = json.loads(raw.decode())
             except (ValueError, UnicodeDecodeError):
-                fault = raw.decode(errors="replace").strip()
+                parsed = raw.decode(errors="replace").strip()
+            fault = parsed.get("fault_message", "") if isinstance(parsed, dict) else str(parsed)
             raise MvError(
                 "api-error",
                 f"{method} {path} failed with HTTP {resp.status}",
@@ -134,6 +134,3 @@ class FcApi:
             "resume_vm": resume,
             "track_dirty_pages": track_dirty_pages,
         })
-
-    def info(self) -> dict:
-        return self.request("GET", "/") or {}

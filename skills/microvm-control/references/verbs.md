@@ -47,7 +47,7 @@ Refusal:
 | --- | --- | --- |
 | `create ID` | `--vcpu N` `--mem MIB` `--ttl SEC` `--tap` `--ip` `--gw` `--prefix` `--fresh-data` | reflinked disks + fresh identity, verified by read-back; auto-allocates a pool tap |
 | `clone SRC ID` | `--fresh-data` `--vcpu` `--mem` `--ttl` `--tap` `--ip` `--gw` `--prefix` | running source is paused for the reflink copy and resumed; copy boots cold |
-| `start ID` | `--no-wait-ssh` `--timeout SEC` | verified by SSH probe; `already_running: true` is a valid reply |
+| `start ID` | `--no-wait-ssh` `--timeout SEC` | verified by SSH probe; `already_running: true` is a valid reply. With `--no-wait-ssh` the reply is honest: `verified: false`, `effect: "unverifiable"` |
 | `stop ID` | `--timeout SEC` | CtrlAltDel; `graceful: false` + `effect: unconfirmed` if signals were needed |
 | `restart ID` | `--no-wait-ssh` `--timeout SEC` | stop then start |
 | `status ID` | `--probe` | `state`, `running`, ttl; `--probe` adds `ssh_reachable` |
@@ -57,7 +57,7 @@ Refusal:
 | `ssh ID` | — | interactive shell (replaces the process) |
 | `logs ID` | `--firecracker` `--tail N` | `lines[]`, `path` |
 | `delete ID` | `--yes` `--purge` `--force` `--timeout SEC` | moves to `<home>/trash` unless `--purge` |
-| `browser ID` | `--dom URL` \| `--screenshot URL` \| `--pdf URL`, `--out FILE`, `--window-size W,H`, `--timeout SEC` | headless Chromium in the guest: DOM text, or a verified PNG/PDF (`out_path`, `bytes`, `sha256`, `magic_ok`) |
+| `browser ID` | `--dom URL` \| `--screenshot URL` \| `--pdf URL`, `--out FILE`, `--window-size W,H`, `--timeout SEC` | headless Chromium in the guest: DOM text (large DOMs go to `out_path`), or a verified PNG/PDF (`out_path`, `bytes`, `sha256`, `magic_ok`) |
 | `reap` | `--older-than SEC` `--timeout SEC` | deletes TTL-expired instances (and, with `--older-than`, long-stopped ones) |
 | `gc` | `--trash-days N` `--artifact-days N` `--snapshot-days N` | removes old trash entries, exec artifacts and snapshots (`--snapshot-days` is opt-in) |
 

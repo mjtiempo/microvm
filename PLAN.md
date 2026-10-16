@@ -370,6 +370,17 @@ guest-side bridge and duplicates the SSH-over-tap path; **diff snapshot
 chains** are an optimisation on top of the full snapshots that clone and
 restore already use.
 
+**Post-review hardening** (2026-10-17): fixed the `net install` ownership bug
+(sudo now hands `net.json`/`audit.log` back to the invoking user, and `doctor`
+detects leftovers); `start --no-wait-ssh` no longer claims `verified`;
+`_kill_process` refuses recycled pids; clone/backup hold the source lock;
+downloads are checksum-verified; instance quotas are enforced; inode metadata
+is verified after `debugfs` writes; `image build` repairs incomplete image
+sets; `start` resolves the instance's own runtime; restores refuse hostile
+archive members, redact audit argv and check free space; the suites kill only
+their own VMs; state is 0700 with a 0600 audit log. Covered by 17 unit tests
+and `tests/accept/m5-hardening.sh`.
+
 ## 13. First actions (next session)
 
 1. Create the package skeleton and the error/envelope contract

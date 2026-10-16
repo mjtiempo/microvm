@@ -41,7 +41,6 @@ verbs=$("$MC" --help | sed -n 's/.*{\([a-z,]*\)}.*/\1/p' | tr ',' '\n' | sort -u
 count=$(printf '%s\n' "$verbs" | grep -c .)
 for v in $verbs; do
   grep -qF "\`$v\`" "$VERBS" || fail "verb '$v' is not documented in verbs.md"
-  count=$((count + 1))
 done
 [ "$count" -ge 20 ] || fail "unexpectedly few verbs parsed ($count)"
 printf 'documented verbs: %s\n' "$count"
@@ -69,6 +68,43 @@ printf '\n== doctor and caps reply shapes\n'
   || fail "doctor"
 "$MC" caps | jq -e '.data.base.firecracker != null and .data.net.mode == "shared-tap" or .data.net.mode == "pool"' >/dev/null \
   || fail "caps"
+
+printf '\n== state hardening\n'
+[ "$(stat -c '%a' "$MICROVM_HOME")" = "700" ] || fail "state dir is not 0700"
+[ "$(stat -c '%a' "$MICROVM_HOME/audit.log")" = "600" ] || fail "audit.log is not 0600"
+
+printf '\n== instance quota\n'
+echo '{"max_instances": 1}' > "$MICROVM_HOME/config.json"
+"$MC" create one | jq -e '.ok' >/dev/null || fail "create one"
+if "$MC" create two >"$WORK/quota.json" 2>/dev/null; then fail "quota not enforced"; fi
+jq -e '.error.code == "quota-exceeded"' "$WORK/quota.json" >/dev/null || fail "wrong quota code"
+"$MC" delete one --yes | jq -e '.ok' >/dev/null || fail "delete one"
+rm -f "$MICROVM_HOME/config.json"
+
+printf '\n== start refuses a missing runtime\n'
+"$MC" create demo >/dev/null
+mkdir -p "$WORK/no-runtime"
+python3 - "$MICROVM_HOME/instances/demo/meta.json" "$WORK/no-runtime" <<'PY'
+import json, sys
+path, runtime = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    meta = json.load(handle)
+meta["config"]["image_dir"] = runtime
+with open(path, "w") as handle:
+    json.dump(meta, handle)
+PY
+if "$MC" start demo >"$WORK/runtime.json" 2>/dev/null; then fail "missing runtime accepted"; fi
+jq -e '.error.code == "image-missing"' "$WORK/runtime.json" >/dev/null || fail "wrong runtime code"
+"$MC" delete demo --yes >/dev/null
+
+printf '\n== doctor detects unreadable pool state\n'
+echo '{}' > "$MICROVM_HOME/net.json"
+chmod 000 "$MICROVM_HOME/net.json"
+"$MC" doctor > "$WORK/doctor.json" 2>/dev/null || true
+jq -e '[.data.checks[] | select(.name == "net-state" and .ok == false)] | length == 1' "$WORK/doctor.json" >/dev/null \
+  || fail "doctor did not flag net.json"
+chmod 600 "$MICROVM_HOME/net.json"
+rm -f "$MICROVM_HOME/net.json"
 
 printf '\n== dry-run contract\n'
 "$MC" --dry-run create demo | jq -e '.ok == true and .data.dry_run == true and (.data.plan | length) > 0' >/dev/null \

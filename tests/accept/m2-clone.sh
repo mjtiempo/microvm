@@ -5,6 +5,7 @@
 # Usage: tests/accept/m2-clone.sh
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/../.."
+. "$PWD/tests/accept/lib.sh"
 
 MC="$PWD/microvm-control"
 WORK=$(mktemp -d "$HOME/.cache/microvm-accept-m2.XXXXXX")
@@ -12,7 +13,7 @@ export MICROVM_HOME="$WORK/home" MC WORK
 mkdir -p "$MICROVM_HOME"
 
 cleanup() {
-  pkill -x firecracker 2>/dev/null || true
+  kill_own_vms "$MICROVM_HOME" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -48,6 +49,10 @@ fi
 "$MC" exec src -- cat /root/.ssh/authorized_keys | jq -jr '.data.stdout' > "$WORK/guest-ak"
 cmp -s "$WORK/guest-ak" "$MICROVM_HOME/instances/src/keys/id_ed25519.pub" \
   || fail "guest authorized_keys does not match the instance key"
+debugfs -R 'stat /root/.ssh/authorized_keys' "$MICROVM_HOME/instances/src/disks/rootfs.ext4" 2>/dev/null \
+  | grep -Eq 'Mode: +0600' || fail "authorized_keys mode is not 0600"
+debugfs -R 'stat /root/.ssh' "$MICROVM_HOME/instances/src/disks/rootfs.ext4" 2>/dev/null \
+  | grep -Eq 'Mode: +0700' || fail ".ssh directory mode is not 0700"
 if ssh -F /dev/null -i "$PWD/keys/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes \
      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 \
      root@172.16.4.2 true >/dev/null 2>&1; then
@@ -109,7 +114,9 @@ say "snapshot delete"
 
 say "gc prunes old snapshots when asked"
 "$MC" snapshot create src --name gcme >/dev/null
-"$MC" gc --snapshot-days 0 | jq -e '.data.removed >= 1' >/dev/null || fail "gc snapshots"
+"$MC" gc --snapshot-days 0 \
+  | jq -e '.data.removed >= 1 and (.data.items | length >= 1) and .data.items[0].kind == "snapshot"' >/dev/null \
+  || fail "gc snapshots"
 [ ! -e "$MICROVM_HOME/instances/src/snapshots/gcme" ] || fail "snapshot not pruned"
 
 say "reap deletes TTL-expired instances"

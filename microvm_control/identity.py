@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -41,8 +42,39 @@ def read_file(image: Path, path: str) -> bytes:
     cp = run(["debugfs", "-R", f"cat {path}", str(image)])
     if cp.returncode != 0 and not _stat(image, path):
         raise MvError("image-read-failed", f"cannot read {path} from {image.name}")
-    lines = [ln for ln in cp.stdout.splitlines(keepends=True) if not ln.startswith("debugfs ")]
-    return "".join(lines).encode()
+    # debugfs prints its banner on stderr, so stdout is the file content as-is
+    return cp.stdout.encode()
+
+
+_FIELD_RE = re.compile(r"\b(Mode|User|Group):\s+(\S+)")
+
+
+def _inode_fields(image: Path, path: str) -> dict:
+    fields = {}
+    for key, value in _FIELD_RE.findall(_stat(image, path)):
+        fields.setdefault(key, value)
+    return fields
+
+
+def verify_inode(image: Path, path: str, mode: int, *, uid: int = 0, gid: int = 0,
+                 kind: str | None = None) -> None:
+    """Refuse when the image's inode does not carry the expected metadata."""
+    st = _stat(image, path)
+    if not st:
+        raise MvError("image-read-failed", f"{path} is missing from {image.name}")
+    if kind and f"Type: {kind}" not in st:
+        raise MvError("image-write-failed", f"{path} is not a {kind}")
+    fields = _inode_fields(image, path)
+    try:
+        actual_mode = int(fields.get("Mode", ""), 8)
+    except ValueError:
+        actual_mode = -1
+    if (actual_mode != (mode & 0o7777) or fields.get("User") != str(uid)
+            or fields.get("Group") != str(gid)):
+        raise MvError("image-write-failed", f"inode metadata for {path} is wrong",
+                      detail={"expected": {"mode": oct(mode & 0o7777), "uid": uid, "gid": gid},
+                              "actual": {"mode": fields.get("Mode"), "uid": fields.get("User"),
+                                         "gid": fields.get("Group")}})
 
 
 def ensure_dir(image: Path, path: str) -> None:
@@ -71,6 +103,7 @@ def write_file(image: Path, path: str, data: bytes, mode: str = "0100644") -> No
             pass
     if read_file(image, path) != data:
         raise MvError("image-write-failed", f"read-back of {path} does not match what was written")
+    verify_inode(image, path, int(mode, 8))
 
 
 def _generate_host_keys(workdir: Path, instance: str) -> Path:
@@ -127,6 +160,7 @@ def inject_identity(rootfs: Path, *, instance: str, hostname: str, ip: str,
         # 040000 = S_IFDIR; 0100000 would turn the directory into a regular file
         for field, value in (("mode", "040700"), ("uid", "0"), ("gid", "0")):
             _debugfs(rootfs, [f"sif /root/.ssh {field} {value}"], write=True, check=False)
+        verify_inode(rootfs, "/root/.ssh", 0o700, kind="directory")
         write_file(rootfs, "/root/.ssh/authorized_keys", authorized_keys, "0100600")
 
     for stale in STALE_HOST_KEY_TYPES:
