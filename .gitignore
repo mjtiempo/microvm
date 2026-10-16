@@ -7,3 +7,7 @@
 
 # guest ssh keypair (contains a private key - never commit)
 /keys/
+
+# python
+__pycache__/
+*.pyc

@@ -343,7 +343,7 @@ M2 once the CLI covers them and `README.md` points at the CLI.
 
 | # | Deliverable | Acceptance (runnable) | Size |
 | --- | --- | --- | --- |
-| M0 | scaffolding: `fcapi`, `store`, `errors`, JSON envelope; `start/stop/status/list` on the existing `images/` + `fc-tap` | `start demo` → `verified: true` with SSH probe; `stop` → no process; all replies schema 1 | S–M |
+| ✅ M0 | scaffolding: `fcapi`, `store`, `errors`, JSON envelope; full lifecycle on the existing `images/` + `fc-tap` (`create/start/stop/restart/status/list/exec/cp/logs/delete/caps/doctor/image build`) | `tests/accept/m0.sh` green rootless: create → start → exec → cp → status → logs → stop → delete | S–M |
 | M1 | tap pool + `net install` systemd unit + `create/delete/exec/cp/logs/reap` + locks + `doctor` + userns test lane | 3 instances concurrently, each own tap/IP; create→exec→delete < 10 s; `tests/accept/m1.sh` green rootless | M |
 | M2 | snapshot/clone: reflink cold clone, live clone, identity injection, snapshot guard | `clone demo demo2` < 2 s, demo2 boots with new host keys/IP while demo keeps running; source resumes cleanly | M |
 | M3 | backup/restore: manifest + sha256 + tar.zst, running backup, restore with `--verify boot` | backup of running instance restored on a new id; pre-backup file present; flipped-byte archive refused | M |
@@ -352,6 +352,13 @@ M2 once the CLI covers them and `README.md` points at the CLI.
 
 Sizes: S ≈ half a day, M ≈ 1–2 days, L ≈ 3+ days, at this repo's current
 pace.
+
+Status: **M0 delivered** (2026-10-16) and passing `tests/accept/m0.sh`;
+JSON contract with `ok/verified/effect/rung`, `ERR[code]`
+refusals, `--dry-run`, per-instance identity (hostname, `/30`-ready interfaces,
+fresh ssh host keys) injected with `debugfs`, and reflinked disks. Next: M1
+(`netpool.py`, tap pool + `net install` systemd unit, `reap`, per-instance ssh
+keys).
 
 ## 13. First actions (next session)
 
@@ -364,18 +371,21 @@ pace.
 4. Write `tests/accept/m0.sh` (rootless) and wire it into `test.sh`.
 5. Only then expand verbs (M1).
 
-## 14. Open decisions
+## 14. Decisions (confirmed)
 
-| # | Question | Recommendation |
+| # | Question | Decision |
 | --- | --- | --- |
-| 1 | State dir: XDG vs repo `var/` | `~/.local/share/microvm`, `MICROVM_HOME` override |
-| 2 | Language: Python stdlib vs Go/Rust | Python 3 stdlib (matches existing CLIs, host has 3.14) |
-| 3 | Tap pool default size | 8, `/30` per tap, index 0 reserved |
-| 4 | SSH keys: one control key vs per-instance | per-instance in M2; single key until then |
-| 5 | Live clone: full memory snapshot vs diff chains | full in M2, diff chains in M5 (GC complexity) |
-| 6 | Daemon/JSON-RPC vs CLI-only | CLI-only first; daemon only if concurrent agent access demands it |
-| 7 | Accept a one-time `sudo net install` | yes — it is the price of zero-root runtime |
-| 8 | Name | `microvm-control` (matches `computer-control`) |
+| 1 | State dir | `~/.local/share/microvm`, `MICROVM_HOME` override |
+| 2 | Language | Python 3 stdlib only |
+| 3 | One-time `sudo net install` | accepted |
+| 4 | SSH keys | per-instance in M2; single control key until then |
+| 5 | Live clone | full memory snapshot in M2, diff chains later |
+| 6 | Daemon | CLI-only; daemon only if concurrent agent access demands it |
+| 7 | Tap pool | 8 taps, `/30` per tap, index 0 reserved |
+| 8 | Name | `microvm-control` |
+
+M0 deviation: instance `meta.json` records `size_bytes` per disk; sha256 hashes
+arrive with backup/snapshot manifests (M3), not on every create.
 
 ## 15. Risks
 

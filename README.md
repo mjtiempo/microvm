@@ -10,7 +10,31 @@ No host root is needed to build the images (a user namespace is used for
 staging, so the guest sees proper root-owned files). Root is only needed once
 to create the tap device + NAT.
 
-## Quickstart
+## Control CLI — `microvm-control` (M0)
+
+`microvm-control` is the agent-facing entry point: one verb per process, one
+JSON object per call, `ERR[code]` refusals (exit 1, usage 2), `--dry-run`, and
+state under `~/.local/share/microvm` (`MICROVM_HOME` overrides). M0 verbs:
+
+```bash
+microvm-control image build                # once: build/import the base image set
+microvm-control doctor | jq .data.checks   # preflight
+microvm-control create demo --ttl 3600     # reflinked disks + fresh ssh host keys
+microvm-control start demo                 # boots via the API, waits for ssh readiness
+microvm-control exec demo -- uname -a      # exit_code is data, not a refusal
+microvm-control cp demo:/etc/alpine-release ./alpine-release
+microvm-control logs demo --tail 50
+microvm-control status demo --probe
+microvm-control stop demo && microvm-control restart demo
+microvm-control list | jq .data.instances
+microvm-control delete demo --yes          # moves to ~/.local/share/microvm/trash
+```
+
+M0 networking is the shared `fc-tap` (stop another instance before starting
+one; the tap pool arrives in M1). `tests/accept/m0.sh` exercises the whole
+lifecycle rootless, in a private user+network namespace.
+
+## Quickstart (shell scripts)
 
 ```bash
 ./build.sh          # download firecracker/kernel/alpine, build ext4 images

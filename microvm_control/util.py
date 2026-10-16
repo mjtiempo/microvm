@@ -1,0 +1,116 @@
+"""Small helpers: process running, hashing, sizes, atomic JSON."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .errors import MvError
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def now_epoch() -> float:
+    return time.time()
+
+
+def run(cmd, *, input: str | None = None, timeout: float | None = None, cwd=None):
+    return subprocess.run(
+        [str(c) for c in cmd],
+        input=input,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        cwd=str(cwd) if cwd else None,
+    )
+
+
+def which(name: str) -> str | None:
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        cand = Path(p) / name
+        try:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return str(cand)
+        except OSError:
+            # PATH entries can vanish or be unreadable; keep looking
+            continue
+    return None
+
+
+def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    try:
+        f = open(path, "rb")
+    except OSError as exc:
+        raise MvError(
+            "read-failed", f"could not read {path}: {exc.strerror or exc}"
+        ) from exc
+    with f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def atomic_write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def du_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def free_bytes(path: Path) -> int:
+    st = os.statvfs(str(path))
+    return st.f_bavail * st.f_frsize
+
+
+def copy_file(src: Path, dst: Path) -> str:
+    """Copy a file, preferring a btrfs/XFS reflink (instant COW)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cp = run(["cp", "-p", "--reflink=always", "--sparse=always", str(src), str(dst)])
+    if cp.returncode == 0:
+        return "reflink"
+    cp = run(["cp", "-p", "--reflink=auto", "--sparse=always", str(src), str(dst)])
+    if cp.returncode != 0:
+        raise MvError(
+            "copy-failed",
+            f"could not copy {src} to {dst}",
+            detail=(cp.stderr or "").strip()[-500:],
+        )
+    return "copy"

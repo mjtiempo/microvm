@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# microvm-control launcher: runs the repo package with the repo on PYTHONPATH,
+# so a symlink in ~/.local/bin works from any directory.
+set -euo pipefail
+DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+exec env PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -m microvm_control "$@"

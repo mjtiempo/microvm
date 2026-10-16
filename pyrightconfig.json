@@ -1,0 +1,7 @@
+{
+  "include": ["microvm_control"],
+  "extraPaths": ["."],
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.14",
+  "reportMissingImports": "error"
+}
