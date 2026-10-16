@@ -1,0 +1,9 @@
+# downloaded / built by ./build.sh
+/build/
+/images/
+
+# run-time state: api socket, logs
+/run/
+
+# guest ssh keypair (contains a private key - never commit)
+/keys/
