@@ -14,7 +14,7 @@ present (failed hashes, API fault message, tap lists, …).
 | `bad-state` | `meta.json` / `net.json` is unreadable, or a privileged verb's state dir resolves outside the invoking user's home (symlinked `--home`). Inspect the file; re-init the pool or delete the instance |
 | `invalid-id` | id/snapshot name must match `[a-z0-9][a-z0-9-]{0,30}` |
 | `bad-args` | flag combination is invalid (e.g. `--tap` without `--ip`); the hint shows the accepted form |
-| `destructive-needs-yes` | `delete` / `net uninstall` without `--yes` while stdin is not a TTY |
+| `destructive-needs-yes` | `delete` without `--yes` while stdin is not a TTY. `net uninstall` takes no `--yes` (it is root-gated) |
 | `quota-exceeded` | the instance limit is reached (default 8, or `max_instances` in `<home>/config.json`). Delete an instance or raise the limit |
 | `locked` | cannot open an instance or net lock file |
 
@@ -82,6 +82,42 @@ present (failed hashes, API fault message, tap lists, …).
 | `backup-failed` | archiving failed (tar, `qemu-img`, or a missing artifact) |
 | `backup-corrupt` | the archive is unreadable, has unsafe/escaping member names, or a size/sha256 check failed; do not restore it |
 | `restore-failed` | decoding or materialising the restored instance failed |
+
+## Browser (CDP in the guest)
+
+| code | meaning / fix |
+| --- | --- |
+| `browser-not-running` | no controlled browser is running in the instance. `microvm-control browser <id> start` |
+| `browser-start-failed` | chromium did not launch, never published `DevToolsActivePort`, or its pid does not carry our profile/port; `error.detail` has the stderr or the log tail (`/persist/work/browser-chromium.log`) |
+| `browser-identity-changed` | the recorded guest pid no longer runs our `--user-data-dir`/`--remote-debugging-port`, or the endpoint reports another fingerprint. `browser <id> stop` then `start` |
+| `cdp-unreachable` | the endpoint does not answer on the recorded port (the browser died) or the forward failed |
+| `cdp-error` | the DevTools protocol refused the call; `error.detail` carries the protocol error object |
+| `cdp-not-local` | `/json/version` names a websocket off loopback — refused, nothing sent |
+| `eval-timeout` | the page did not answer within the deadline (a parked renderer). Try `dialog state`, then `nav` to escape |
+| `no-page-tab` | no page tab matches (or none are open); `browser <id> tabs` lists them |
+| `tab-ambiguous` | several tabs match `--tab`; use `id:<prefix>` or a longer substring |
+| `no-match` | nothing matched the TEXT/selector (or `select`'s value — options are in `error.detail`) |
+| `ambiguous-option` | several `<option>`s match `select --value`; use the exact value |
+| `occluded` | the element's centre is covered; scroll it in, use `--at`, or pick another target |
+| `no-focus` | nothing editable is focused; `browser <id> focus` a field first |
+| `focus-not-verified` | the focus did not land on the named element |
+| `not-checkable` | the control has no `checked` state |
+| `check-not-verified` | the control did not reach the requested state |
+| `not-a-select` | `select --selector` is not a `<select>` |
+| `nav-failed` | the navigation ended on an error page (or a download) |
+| `nav-not-verified` | the requested URL was not observed before the deadline |
+| `reload-not-verified` | the document did not restart |
+| `wait-timeout` | the `wait` predicate never passed; raise `--timeout` |
+| `screenshot-not-verified` | the PNG's own IHDR did not match the region × `devicePixelRatio`; nothing was written |
+| `file-exists` | the output path exists; `--force` to overwrite |
+| `write-failed` | the artifact could not be written (permissions, disk) |
+| `no-viewport` | the page reports no viewport (windowless/never shown) |
+| `result-too-large` | `js` returned more than the cap; narrow the expression |
+| `js-error` | the page expression threw; the message is the page's own |
+| `no-dialog` | no JavaScript dialog is showing |
+| `no-file` | the guest path does not exist; `cp` it into the guest first |
+| `upload-not-verified` | no files landed on the input |
+| `close-tab-not-verified` | tabs survived `close`; `error.detail.survivors` names them |
 
 ## Other
 

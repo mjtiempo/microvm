@@ -8,7 +8,8 @@ description: Drive Firecracker microVMs on this machine through microvm-control 
 One VM action is one `microvm-control <verb>` process, run on the machine that
 hosts the VMs. `microvm-control` is on `PATH` (a symlink to the repo launcher).
 
-- **stdout**: exactly one JSON object for every non-interactive verb.
+- **stdout**: exactly one JSON object for every invocation that parses; a usage
+error (exit 2) prints argparse usage on stderr and nothing on stdout.
 - **stderr**: `ERR[code]: message` on a refusal (plus a `hint:` line when known).
 - Exit status: `0` ok, `1` refusal, `2` usage error, `130` interrupt.
 - Every reply carries `"schema": 1`. Mutating verbs also carry the outcome
@@ -35,8 +36,8 @@ A mutation is never `ok: true` on a bare acknowledgement:
 | verb | verified by |
 | --- | --- |
 | `create` / `clone` / `restore` | reading the new identity back from the disk image |
-| `start` / `snapshot load` | an SSH probe into the guest (`ssh_ready_ms`); with `--no-wait-ssh`, `start` says `verified: false` / `effect: "unverifiable"` |
-| `stop` | the Firecracker process being gone; `unconfirmed` if signals were needed |
+| `start` / `snapshot load` | an SSH probe into the guest (`ssh_ready_ms`); with `--no-wait-ssh`, `start` says `verified: false` / `effect: "unverifiable"`; `already_running: true` is a valid reply |
+| `stop` | the Firecracker process being gone; `unconfirmed` if signals were needed; an already-stopped instance is a no-op with `verified: false` / `unverifiable` |
 | `snapshot create` | snapshot files exist and are non-empty |
 | `backup` | the manifest is read back out of the archive |
 | `restore` | every manifest sha256 verified before the instance is created |
@@ -61,9 +62,21 @@ microvm-control delete demo --yes          # moved to <home>/trash
 ```
 
 `start` waits for SSH by default (`--no-wait-ssh` to skip). `stop` uses the
-Firecracker API (CtrlAltDel); a guest `reboot` also exits the VM. Destructive
-verbs need `--yes` when stdin is not a TTY, and `--dry-run` prints the plan
-without touching anything.
+Firecracker API (CtrlAltDel); a guest `reboot` also exits the VM. `delete`
+needs `--yes` when stdin is not a TTY (`destructive-needs-yes`); `--dry-run`
+prints the plan without touching anything.
+
+## Browser control
+
+`browser ID <action>` drives the long-running headless Chromium in the guest
+over CDP: `start`/`stop`/`status`/`restart`, `open`/`tabs`/`close`/`nav`, `text`/
+`find`/`extract`/`dom`, `click`/`hover`/`focus`/`press`/`insert`/`type`/`check`/
+`select`/`scroll`/`wait`, `screenshot`/`pdf`/`js`/`dialog`, `upload` (guest
+paths). Nothing auto-starts: a stopped VM refuses `not-running`, a stopped
+browser refuses `browser-not-running` with the `start` hint. Mutations are
+verified by read-back (`changed`, `moved`, `checked`, `length_after`, the PNG's
+own IHDR); `js`, `press` and `--at` clicks say `verified: false` honestly. The
+legacy one-shot flags (`--dom`/`--screenshot`/`--pdf`) still work unchanged.
 
 ## Networking
 
@@ -101,9 +114,11 @@ instance, and `--verify` boots it and waits for SSH.
 ## Addressing and replies
 
 - Instance ids and snapshot names: `[a-z0-9][a-z0-9-]{0,30}`.
-- `exec ID -- CMD ARGS...`: large stdout is written to a file and the reply
-  gives `out_path`, `stdout_bytes`, `stdout_sha256`; it is never silently
-  truncated.
+- `exec ID -- CMD ARGS...`: stdout over 16 KiB is written to a file — the reply
+  sets `stdout_truncated: true` and gives `out_path`, `stdout_bytes`,
+  `stdout_sha256` (inline replies carry `stdout` and `stdout_sha256: null`).
+  `stderr` is capped at 16 KiB with `stderr_truncated`; nothing is dropped
+  without a flag.
 - `error.detail` carries structured evidence (list of failed hashes, API fault
   message, tap list, …). Branch on `error.code`, not on message text.
 - `audit --tail N` returns the JSONL trail of every invocation

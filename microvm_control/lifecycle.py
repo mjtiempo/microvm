@@ -26,6 +26,7 @@ from microvm_control import identity  # pyright: ignore[reportAttributeAccessIss
 from microvm_control import netpool  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control import sshx  # pyright: ignore[reportAttributeAccessIssue]
 from microvm_control.errors import DryRun, MvError
+from microvm_control.browser import state as browser_state
 from microvm_control.output import envelope
 from microvm_control.store import (  # pyright: ignore[reportMissingImports]
     Instance,
@@ -918,6 +919,11 @@ def _delete_instance(inst: Instance, home: Path, *, purge: bool, force: bool,
             else:
                 _stop_instance(inst, meta, timeout)
     freed = du_bytes(inst.dir)
+    # `delete` clears the browser state with the instance: the record is a
+    # fact about THIS VM, and a trashed instance must never claim a live
+    # browser. (A VM `stop` deliberately leaves it — the guest pid dies with
+    # the VM and the next browser verb reconciles it.)
+    browser_state.clear(inst)
     if purge:
         _rmtree(inst.dir)
         trash_path = None

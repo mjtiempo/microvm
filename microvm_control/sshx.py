@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -130,3 +132,66 @@ def scp(key: Path, known_hosts: Path, src: str, dst: str) -> None:
     if cp.returncode != 0:
         raise MvError("scp-failed", f"scp {src} -> {dst} failed",
                       detail=(cp.stderr or cp.stdout).strip()[-400:])
+
+
+def free_port() -> int:
+    """A loopback port the kernel just handed us; bound then released."""
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def forward_argv(key: Path, known_hosts: Path, ip: str, local_port: int,
+                 guest_port: int) -> list[str]:
+    """`ssh -N -L 127.0.0.1:LOCAL:127.0.0.1:GUEST root@ip` with the pinned options."""
+    argv = ssh_argv(key, known_hosts, ip)
+    destination = argv[-1]
+    return [*argv[:-1], "-N", "-L",
+            f"127.0.0.1:{int(local_port)}:127.0.0.1:{int(guest_port)}",
+            destination]
+
+
+@contextlib.contextmanager
+def forward(key: Path, known_hosts: Path, ip: str, guest_port: int,
+            timeout: float = 10.0):
+    """An ephemeral local forward to the guest's loopback port.
+
+    One `ssh -N -L` per browser invocation: it is opened here, used for the
+    call, and reaped on the way out. Nothing survives the process, so there
+    is no tunnel pid to reconcile and no local port to leak.
+    """
+    local_port = free_port()
+    argv = forward_argv(key, known_hosts, ip, local_port, guest_port)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + max(1.0, timeout)
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stderr = (proc.stderr.read() if proc.stderr else b"")
+                raise MvError("ssh-failed",
+                              f"the forward to {ip}:{guest_port} exited",
+                              detail=_decode(stderr)[-300:] or None)
+            try:
+                with socket.create_connection(("127.0.0.1", local_port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise MvError("ssh-failed",
+                          f"the forward to {ip}:{guest_port} did not open")
+        yield local_port
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()

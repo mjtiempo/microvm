@@ -100,6 +100,28 @@ per-instance keys.
 
 ## Browser
 
+**Controlled browser.** `microvm-control browser <id> <action>` drives a
+long-running headless Chromium in the guest over CDP — navigate, read text,
+click, type, wait, extract records, screenshot/PDF, all with the house
+read-back contract. `browser <id> start` boots it (nothing auto-starts),
+`browser <id> status` reconciles the recorded guest pid and endpoint
+fingerprint, and `browser <id> stop` ends it. The core (WebSocket + CDP +
+DOM verbs) is vendored in `microvm_control/browser/` from
+`mark-browser-control` (MIT) — see `PLAN-browser.md`. The launch carries a windowed user-agent (built from the guest binary's own
+version) and `--disable-blink-features=AutomationControlled`, so a strict bot
+check does not see `HeadlessChrome` or `navigator.webdriver`. Nothing is
+exposed on the tap: each call opens an ephemeral `ssh -N -L` to the guest's
+loopback DevTools port and tears it down.
+
+```bash
+microvm-control browser demo start
+microvm-control browser demo open https://example.com
+microvm-control browser demo text --chars 500 | jq -r .data.text
+microvm-control browser demo click "Learn more" | jq .data.changed
+microvm-control browser demo screenshot --out page.png
+microvm-control browser demo stop
+```
+
 Terminal browsing:
 
 ```bash

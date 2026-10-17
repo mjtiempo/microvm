@@ -45,11 +45,72 @@ done
 [ "$count" -ge 20 ] || fail "unexpectedly few verbs parsed ($count)"
 printf 'documented verbs: %s\n' "$count"
 
+printf '\n== every CLI flag is documented\n'
+python3 - "$MC" "$VERBS" <<'PY' || fail "undocumented CLI flags"
+import re, subprocess, sys
+
+mc, verbs_md = sys.argv[1], sys.argv[2]
+doc = open(verbs_md).read()
+
+
+def flags(text):
+    return set(re.findall(r"(?<![\w-])--([a-z][a-z0-9-]*)", text)) - {"help"}
+
+
+def help_of(*args):
+    res = subprocess.run([mc, *args, "--help"], capture_output=True, text=True)
+    return res.stdout + res.stderr
+
+
+def doc_rows(name):
+    pattern = rf"^\|\s*`{re.escape(name)}[`\s]"
+    return "\n".join(line for line in doc.splitlines() if re.match(pattern, line))
+
+
+top = help_of()
+missing = {f"(global): --{f}" for f in flags(top) if f"`--{f}" not in doc}
+verbs = re.search(r"\{([a-z,]+)\}", top).group(1).split(",")
+for verb in verbs:
+    text = help_of(verb)
+    subs = re.search(r"\{([a-z,]+)\}", text)
+    subs = subs.group(1).split(",") if subs else []
+    if subs and verb == "browser":
+        # `browser ID <action>`: the parser takes an id before the subcommand,
+        # so the help that names the action is `browser x <action> --help` and
+        # the docs rows are `browser ID <action>`.
+        parent_rows = doc_rows(verb)
+        missing |= {f"{verb} (legacy): --{flag}" for flag in flags(help_of(verb))
+                    if f"`--{flag}" not in parent_rows}
+        for sub in subs:
+            label = f"{verb} ID {sub}"
+            rows = doc_rows(label)
+            if not rows:
+                missing.add(label + ": no row")
+                continue
+            body = help_of(verb, "x", sub)
+            missing |= {label + f": --{flag}" for flag in flags(body)
+                        if f"`--{flag}" not in rows}
+        continue
+    for sub in subs or [""]:
+        label = f"{verb} {sub}".strip()
+        rows = doc_rows(label)
+        if not rows:
+            missing.add(label + ": no row")
+            continue
+        body = help_of(verb, *([sub] if sub else []))
+        missing |= {label + f": --{flag}" for flag in flags(body)
+                    if f"`--{flag}" not in rows}
+if missing:
+    print("undocumented flags: " + ", ".join(sorted(missing)), file=sys.stderr)
+    sys.exit(1)
+print(f"all CLI flags documented ({len(verbs)} verbs)")
+PY
+
 printf '\n== every refusal code used in the package is documented\n'
 python3 - <<'PY' > "$WORK/codes.txt"
 import pathlib, re
 codes = set()
-for path in pathlib.Path("microvm_control").glob("*.py"):
+for path in pathlib.Path("microvm_control").rglob("*.py"):
     for match in re.finditer(r'MvError\(\s*"([a-z0-9-]+)"', path.read_text()):
         codes.add(match.group(1))
 print("\n".join(sorted(codes)))

@@ -104,7 +104,7 @@ def _validate_staging_files(staging: Path, manifest: dict) -> list[dict]:
             bad.append({"name": None, "reason": "malformed"})
             continue
         name = entry.get("name")
-        if not _safe_member_name(name):
+        if not isinstance(name, str) or not _safe_member_name(name):
             bad.append({"name": name, "reason": "unsafe-name"})
             continue
         path = staging / name

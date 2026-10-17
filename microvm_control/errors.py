@@ -1,7 +1,8 @@
 """Error codes, exit statuses and the refusal contract.
 
 Exit status: 0 ok, 1 refusal (ERR[code) on stderr), 2 usage (argparse), 130 interrupt.
-Every invocation still prints exactly one JSON object on stdout.
+Every invocation that parses still prints exactly one JSON object on stdout
+(a usage error prints none).
 """
 
 from __future__ import annotations

@@ -2,7 +2,8 @@
 
 Global flags come before the verb; everything after the verb belongs to it.
 Exit status: 0 ok, 1 refusal (ERR[code] on stderr), 2 usage, 130 interrupt.
-Exactly one JSON object is printed on stdout for every non-interactive verb.
+Exactly one JSON object is printed on stdout for every invocation that parses
+(a usage error prints none).
 """
 
 from __future__ import annotations
@@ -107,15 +108,126 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--snapshot-days", type=int, default=None,
                       help="prune snapshots older than N days (disabled by default)")
 
-    p_browser = sub.add_parser("browser", help="headless Chromium in the guest (dom/screenshot/pdf)")
+    p_browser = sub.add_parser(
+        "browser",
+        help="headless Chromium in the guest: subcommands, or --dom/--screenshot/--pdf")
     p_browser.add_argument("id")
-    browser_action = p_browser.add_mutually_exclusive_group(required=True)
-    browser_action.add_argument("--dom", metavar="URL", help="print the rendered DOM")
-    browser_action.add_argument("--screenshot", metavar="URL", help="save a PNG")
-    browser_action.add_argument("--pdf", metavar="URL", help="save a PDF")
+    browser_action = p_browser.add_mutually_exclusive_group(required=False)
+    browser_action.add_argument("--dom", metavar="URL",
+                                help="print the rendered DOM (legacy, one-shot)")
+    browser_action.add_argument("--screenshot", metavar="URL",
+                                help="save a PNG (legacy, one-shot)")
+    browser_action.add_argument("--pdf", metavar="URL",
+                                help="save a PDF (legacy, one-shot)")
     p_browser.add_argument("--out", default=None, metavar="FILE")
     p_browser.add_argument("--window-size", default="1280,800", metavar="W,H")
-    p_browser.add_argument("--timeout", type=float, default=None, dest="timeout_verb", metavar="SEC")
+    p_browser.add_argument("--timeout", type=float, default=None, dest="timeout_verb",
+                           metavar="SEC")
+
+    bsub = p_browser.add_subparsers(dest="browser_verb")
+
+    def _browser_verb(name: str, help_text: str, *, tab: bool = True) -> argparse.ArgumentParser:
+        parser = bsub.add_parser(name, help=help_text)
+        if tab:
+            parser.add_argument("--tab", default=None, metavar="SPEC",
+                                help="id:<prefix>, active, or a title/URL substring")
+        parser.add_argument("--timeout", type=float, default=None,
+                            dest="timeout_verb", metavar="SEC")
+        return parser
+
+    p_start = _browser_verb("start", "launch headless Chromium in the guest", tab=False)
+    p_start.add_argument("--port", type=int, default=9222, metavar="N",
+                         help="guest DevTools port (default 9222; 0 = dynamic)")
+    _browser_verb("stop", "signal the guest browser and clear its state", tab=False)
+    p_restart = _browser_verb("restart", "stop then start", tab=False)
+    p_restart.add_argument("--port", type=int, default=9222, metavar="N")
+    _browser_verb("status", "reconcile the browser state and report", tab=False)
+    p_open = _browser_verb("open", "open one tab per URL", tab=False)
+    p_open.add_argument("urls", nargs="+", metavar="URL")
+    _browser_verb("tabs", "list the page tabs", tab=False)
+    p_close = _browser_verb("close", "close named tabs", tab=False)
+    p_close.add_argument("specs", nargs="*", metavar="SPEC")
+    p_close.add_argument("--all", action="store_true")
+    p_nav = _browser_verb("nav", "navigate the tab")
+    p_nav.add_argument("url", metavar="URL")
+    _browser_verb("back", "go back in the tab's history")
+    _browser_verb("forward", "go forward in the tab's history")
+    _browser_verb("reload", "reload the tab")
+    p_text = _browser_verb("text", "the page's rendered text")
+    p_text.add_argument("--selector", default=None, metavar="CSS")
+    p_text.add_argument("--chars", type=int, default=4000, metavar="N")
+    p_find = _browser_verb("find", "visible elements with boxes and hit-tests")
+    p_find.add_argument("text", nargs="?", default=None, metavar="TEXT")
+    p_find.add_argument("--selector", default=None, metavar="CSS")
+    p_find.add_argument("--cap", type=int, default=10, metavar="N")
+    p_extract = _browser_verb("extract", "turn repeated items into records")
+    p_extract.add_argument("--each", required=True, metavar="CSS")
+    p_extract.add_argument("--field", action="append", required=True, metavar="NAME=SPEC")
+    p_extract.add_argument("--cap", type=int, default=10, metavar="N")
+    p_extract.add_argument("--chars", type=int, default=1000, metavar="N")
+    p_extract.add_argument("--visible", action="store_true")
+    p_extract.add_argument("--unique", default=None, metavar="FIELD")
+    p_dom = _browser_verb("dom", "the rendered DOM (large output spills to --out)")
+    p_dom.add_argument("url", nargs="?", default=None, metavar="URL")
+    p_dom.add_argument("--out", default=None, metavar="FILE")
+    p_click = _browser_verb("click", "click an element or a point")
+    p_click.add_argument("text", nargs="?", default=None, metavar="TEXT")
+    p_click.add_argument("--selector", default=None, metavar="CSS")
+    p_click.add_argument("--index", type=int, default=0, metavar="N")
+    p_click.add_argument("--at", default=None, metavar="X,Y")
+    for _name, _help in (("hover", "move the pointer over an element"),
+                         ("focus", "focus an element")):
+        _p = _browser_verb(_name, _help)
+        _p.add_argument("text", nargs="?", default=None, metavar="TEXT")
+        _p.add_argument("--selector", default=None, metavar="CSS")
+        _p.add_argument("--index", type=int, default=0, metavar="N")
+    p_press = _browser_verb("press", "dispatch one key")
+    p_press.add_argument("key", metavar="KEY")
+    p_insert = _browser_verb("insert", "insert text into the focused field")
+    p_insert.add_argument("value", metavar="TEXT")
+    p_type = _browser_verb("type", "type text with real key events")
+    p_type.add_argument("value", metavar="TEXT")
+    p_type.add_argument("--delay", type=float, default=0.0, metavar="SEC",
+                        help="seconds between keystrokes (0..5; 0 = as fast as possible)")
+    p_check = _browser_verb("check", "check or uncheck a control")
+    p_check.add_argument("text", nargs="?", default=None, metavar="TEXT")
+    p_check.add_argument("--selector", default=None, metavar="CSS")
+    p_check.add_argument("--index", type=int, default=0, metavar="N")
+    p_check.add_argument("--uncheck", action="store_true")
+    p_select = _browser_verb("select", "choose an option by value then label")
+    p_select.add_argument("text", nargs="?", default=None, metavar="TEXT")
+    p_select.add_argument("--selector", required=True, metavar="CSS")
+    p_select.add_argument("--index", type=int, default=0, metavar="N")
+    p_select.add_argument("--value", required=True, metavar="V")
+    p_scroll = _browser_verb("scroll", "scroll the page")
+    p_scroll.add_argument("--by", type=int, default=None, metavar="N")
+    p_scroll.add_argument("--edge", default=None, choices=["top", "bottom"])
+    p_wait = _browser_verb("wait", "poll a predicate to a deadline")
+    p_wait.add_argument("--for", dest="for_", required=True,
+                        choices=["load", "idle", "element", "js"], metavar="KIND")
+    p_wait.add_argument("--selector", default=None, metavar="CSS")
+    p_wait.add_argument("--expr", default=None, metavar="JS")
+    p_wait.add_argument("--idle-ms", type=int, default=500, metavar="MS")
+    p_screenshot = _browser_verb("screenshot", "capture the tab as a verified PNG")
+    p_screenshot.add_argument("url", nargs="?", default=None, metavar="URL")
+    p_screenshot.add_argument("--out", default=None, metavar="FILE")
+    p_screenshot.add_argument("--full", action="store_true")
+    p_screenshot.add_argument("--selector", default=None, metavar="CSS")
+    p_screenshot.add_argument("--index", type=int, default=0, metavar="N")
+    p_screenshot.add_argument("--clip", default=None, metavar="X,Y,W,H")
+    p_screenshot.add_argument("--force", action="store_true")
+    p_pdf = _browser_verb("pdf", "print the tab to PDF")
+    p_pdf.add_argument("url", nargs="?", default=None, metavar="URL")
+    p_pdf.add_argument("--out", default=None, metavar="FILE")
+    p_pdf.add_argument("--force", action="store_true")
+    p_js = _browser_verb("js", "run page JavaScript (declared unverified)")
+    p_js.add_argument("expr", metavar="JS")
+    p_dialog = _browser_verb("dialog", "answer a JavaScript dialog")
+    p_dialog.add_argument("mode", choices=["state", "accept", "dismiss"])
+    p_dialog.add_argument("--text", default="", metavar="V")
+    p_upload = _browser_verb("upload", "set a file input to a guest path")
+    p_upload.add_argument("guest_path", metavar="PATH")
+    p_upload.add_argument("--selector", required=True, metavar="CSS")
 
     p_backup = sub.add_parser("backup", help="archive an instance (disks + meta + sha256 manifest)")
     p_backup.add_argument("id")
@@ -217,6 +329,14 @@ def resolve_home(ns) -> Path:
 
 
 def dispatch(ns, home: Path) -> dict | tuple[dict, int]:
+    if ns.verb == "browser":
+        if getattr(ns, "browser_verb", None) is None and not (
+                ns.dom or ns.screenshot or ns.pdf):
+            raise MvError("bad-args",
+                          "browser: give a subcommand or --dom/--screenshot/--pdf",
+                          hint="microvm-control browser --help")
+        from microvm_control.browser import service as browser_service
+        return browser_service.dispatch(ns, home)
     if ns.verb == "image":
         if ns.image_verb == "build":
             return lifecycle.image_build(ns, home)
@@ -248,7 +368,6 @@ def dispatch(ns, home: Path) -> dict | tuple[dict, int]:
         "ssh": lifecycle.ssh_shell,
         "logs": lifecycle.logs,
         "delete": lifecycle.delete,
-        "browser": lifecycle.browser,
         "caps": lifecycle.caps,
         "doctor": lifecycle.doctor,
         "audit": audit.verb,
