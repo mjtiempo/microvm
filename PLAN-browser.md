@@ -10,9 +10,10 @@ and companion-doc relationship below are unchanged.
 
 Companion docs: `PLAN.md` (the microVM CLI this extends),
 `skills/microvm-control/references/verbs.md` (the surface of record), and
-`../mark-browser-control/docs/plan-remote-cdp.md` (the *other* route: teach
-the generic tool to attach to a tunnel). This plan deliberately does not need
-that one; §10 says why.
+the `browser-control` repo's `docs/plan-remote-cdp.md`
+(<https://github.com/mjtiempo/browser-control/blob/main/docs/plan-remote-cdp.md>)
+— the *other* route: teach the generic tool to attach to a tunnel. This plan
+deliberately does not need that one; §10 says why.
 
 ## 1. Goal
 
@@ -48,7 +49,7 @@ outside a microVM (that is `browser-control-cli`'s job).
 | Guest image (`build.sh`) | Alpine + `chromium` already installed; a browser to drive needs no image change |
 | `/persist` | survives reboots — the browser profile and log can live there |
 | `tests/accept/m2-clone.sh` | already proves the guest can reach a host fixture server and render it; the new suite extends this |
-| `../mark-browser-control` (MIT) | the CDP transport, DOM verbs, target resolution and read-back logic to extract (§4) |
+| [`browser-control`](https://github.com/mjtiempo/browser-control) (MIT) | the CDP transport, DOM verbs, target resolution and read-back logic to extract (§4) |
 | `tests/accept/m4-agent.sh` | the docs↔CLI sync check; new verbs and codes must land in `references/verbs.md` / `errors.md` |
 
 ## 3. Architecture
@@ -354,8 +355,9 @@ MIT attribution: each vendored file keeps the upstream copyright line, and a
 
 ## 10. Why not `browser-control-cli` remotely
 
-The companion plan (`../mark-browser-control/docs/plan-remote-cdp.md`) would
-let the generic tool `attach --cdp-url` a tunnel, with the endpoint's
+The companion plan
+(<https://github.com/mjtiempo/browser-control/blob/main/docs/plan-remote-cdp.md>)
+would let the generic tool `attach --cdp-url` a tunnel, with the endpoint's
 self-reported fingerprint as its only identity oracle (TOFU). That is the
 right shape for a tool that does not own the machine on the far side; it is
 strictly weaker than this plan, which can check the guest's own `/proc`.
